@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.sfx_tags_cache.json
+.DS_Store
