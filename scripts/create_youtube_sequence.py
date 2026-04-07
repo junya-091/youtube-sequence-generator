@@ -32,7 +32,7 @@ TEMPLATE_PATH = Path(__file__).parent.parent / "templates" / "base_sequence.xml"
 
 MAX_CHARS = 19           # SRT 1セグメント最大文字数
 MIN_DUR_MS = 1000        # SRT 最短表示時間 (ms)
-INSERT_DURATION_SEC = 3  # インサート画像の表示秒数
+INSERT_MIN_DURATION_MS = 3000  # インサート画像の最短表示時間 (ms)
 ZOOM_WINDOW_MS = 1200    # key_point 周辺のスケールアップ時間幅 (ms)
 
 PRICE_PER_IMAGE = 0.101  # $0.101/枚 (要確認: gemini-3.1-flash-image-preview / 2K)
@@ -90,10 +90,11 @@ ANALYSIS_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "at_ms": {"type": "integer", "minimum": 0},
+                    "start_ms": {"type": "integer", "minimum": 0},
+                    "end_ms": {"type": "integer", "minimum": 3000},
                     "prompt_en": {"type": "string"},
                 },
-                "required": ["at_ms", "prompt_en"],
+                "required": ["start_ms", "end_ms", "prompt_en"],
             },
         },
         "highlight": {
@@ -474,7 +475,7 @@ def analyze_with_gemini(
 分析してください:
 1. key_points: ズームアップ演出を入れる場面 (笑い・驚き・強調・感情的な瞬間など映像にメリハリが出る全ての場面)。**最低{kp_min}件**（20秒に1件が基本ルール）、最大{kp_max}件。20秒以上ズームが空く区間を作ってはならない
 2. sfx_events: {"効果音を挿入すべき場面 (sfx_id で選択)。**最低 {sfx_min} 件**（40秒に1件が絶対ルール）、最大 {sfx_max} 件。40秒以上効果音が空く区間を作ってはならない" if has_sfx else "（sfx_events は空配列 []）"}
-3. insert_events: 画像インサートを挿入すべき場面 (英語プロンプトを prompt_en に記述)。**最大{insert_max}件以内**に厳選すること。{insert_target_instruction}prompt_en には必ず「Japanese style, set in Japan, featuring Japanese people」等の日本に関連する要素を含めること（外国人・英語テキスト・西洋的なビジュアルは使わない）
+3. insert_events: 画像インサートを挿入すべき場面。**最大{insert_max}件以内**に厳選すること。{insert_target_instruction}各インサートには start_ms（表示開始ms）・end_ms（表示終了ms、start_msより**最低3000ms以上**後）・prompt_en（画像生成用英語プロンプト）を返すこと。表示時間はシーンの内容・テンポに合わせて自然な長さにすること。prompt_en には必ず「Japanese style, set in Japan, featuring Japanese people」等の日本に関連する要素を含めること（外国人・英語テキスト・西洋的なビジュアルは使わない）
 4. highlight: ショート動画・切り抜き用として最も盛り上がる15秒前後の区間を1件。at_ms（開始ms）とduration_ms（10000〜20000msの範囲）、reason（選んだ理由・**日本語**で記述）を返すこと
 5. thumbnail_ideas: サムネイル画像の案を3件。title（視聴者の興味を引く煽りタイトル文・日本語）とdescription（画像の具体的な構図・人物・テキストの説明・日本語）を返すこと
 
@@ -977,15 +978,17 @@ def build_fcp7_xml(
             v2_track.append(ci)
         tl_cursor_v2 += clip.duration_ms
 
-    # ---- V3: インサート画像を配置 (3秒) ----
+    # ---- V3: インサート画像を配置 ----
     v3_track = etree.SubElement(video_elem, "track")
     etree.SubElement(v3_track, "enabled").text = "TRUE"
     etree.SubElement(v3_track, "locked").text = "FALSE"
     for i, (event, img_path) in enumerate(zip(inserts, insert_imgs)):
         if img_path is None:
             continue
-        at_ms = event["at_ms"]
-        dur_ms = INSERT_DURATION_SEC * 1000
+        # start_ms/end_ms 形式を優先、古い at_ms 形式にもフォールバック
+        at_ms = event.get("start_ms", event.get("at_ms", 0))
+        end_ms = event.get("end_ms", at_ms + INSERT_MIN_DURATION_MS)
+        dur_ms = max(end_ms - at_ms, INSERT_MIN_DURATION_MS)
         ci_id = _next_id("ins")
         fid = f"ins-file-{i + 1}"
 
@@ -1094,6 +1097,8 @@ def main():
                         help="既存の segments.json を再利用してWhisperをスキップ。Step2(Gemini分析)/Step3/Step4/5を再実行")
     parser.add_argument("--insert-target", default="",
                         help="インサート画像のターゲット指定（例: '日本人女性20-40代、リアルな3D女性画像多め'）")
+    parser.add_argument("--no-insert", action="store_true",
+                        help="インサート画像の生成をスキップする")
     args = parser.parse_args()
 
     clips_dir = Path(args.clips)
@@ -1206,6 +1211,9 @@ def main():
         print(f"  ✅ captions.srt 保存: {srt_path}")
 
     # ---- Step 4: 画像生成 ----
+    if args.no_insert:
+        print("\n[Step 4] --no-insert 指定 - 画像生成スキップ")
+        insert_events = []
     insert_imgs: List[Optional[Path]] = [None] * len(insert_events)
     if insert_events:
         print(f"\n[Step 4] インサート画像生成中 ({len(insert_events)} 枚)...")
@@ -1273,6 +1281,19 @@ def main():
     print("  - sfx_manifest.json")
     if any(p is not None for p in insert_imgs):
         print("  - inserts/*.png")
+
+    # テロップ装飾: 作業リスト自動生成
+    classify_script = Path("~/.claude/skills/テロップ装飾/scripts/classify_telop.py").expanduser()
+    if classify_script.exists() and srt_path.exists():
+        print("\n🎨 テロップ装飾: 作業リストを生成中...")
+        result = subprocess.run(
+            ["python3", str(classify_script), "--srt", str(srt_path)],
+            capture_output=False,
+        )
+        if result.returncode == 0:
+            print(f"  ✅ 作業リスト.md 保存: {out_dir / '作業リスト.md'}")
+        else:
+            print("  ⚠️ 作業リスト生成に失敗しました（テロップ装飾はスキップ）")
 
 
 if __name__ == "__main__":
