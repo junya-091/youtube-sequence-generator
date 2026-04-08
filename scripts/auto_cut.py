@@ -27,6 +27,13 @@ try:
 except ImportError:
     WHISPERX_AVAILABLE = False
 
+try:
+    import cv2
+    import numpy as np
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
+
 
 @dataclass
 class Config:
@@ -39,6 +46,11 @@ class Config:
     padding_before_sec: float = 0.15
     padding_after_sec: float = 0.10
     min_clip_duration_sec: float = 2.0
+    # モーション検出設定
+    motion_protect: bool = True           # 動きあるシーンの誤カット防止
+    motion_threshold: float = 5.0         # フレーム差分の変化量閾値（%）
+    motion_sample_fps: int = 4            # サンプリングFPS（低くして高速化）
+    motion_min_duration_sec: float = 0.5  # モーション区間の最短持続時間
 
     @classmethod
     def from_json(cls, path: Path) -> "Config":
@@ -218,6 +230,86 @@ start_ms/end_msはミリ秒単位。
     return all_filler, all_rephrase
 
 
+# ===== Step 2.5: モーション検出（誤カット防止） =====
+
+def detect_motion(input_path: Path, config: Config) -> list[Region]:
+    """OpenCV フレーム差分方式で動きあるシーンを検出する。
+    無音でもジェスチャー・動作がある区間をカットから保護するために使用。"""
+    if not OPENCV_AVAILABLE:
+        print("  ⚠️ opencv-python-headless 未インストール → モーション検出スキップ")
+        return []
+
+    print("[Step 2.5] モーション検出中...")
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        print("  ⚠️ 動画を開けませんでした → スキップ")
+        return []
+
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frame_skip = max(1, int(src_fps / config.motion_sample_fps))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    prev_gray = None
+    motion_scores: list[tuple[float, float]] = []  # (time_sec, score)
+    frame_idx = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_idx % frame_skip != 0:
+            frame_idx += 1
+            continue
+
+        time_sec = frame_idx / src_fps
+        small = cv2.resize(frame, (320, 180))
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (21, 21), 0)
+
+        if prev_gray is not None:
+            diff = cv2.absdiff(prev_gray, gray)
+            score = float(np.mean(diff)) / 255.0 * 100  # 0-100% スケール
+            motion_scores.append((time_sec, score))
+
+        prev_gray = gray
+        frame_idx += 1
+
+    cap.release()
+
+    if not motion_scores:
+        print("  モーションデータなし")
+        return []
+
+    # モーション区間を連続区間にまとめる
+    regions: list[Region] = []
+    in_motion = False
+    motion_start = 0.0
+
+    for time_sec, score in motion_scores:
+        if score >= config.motion_threshold:
+            if not in_motion:
+                motion_start = time_sec
+                in_motion = True
+        else:
+            if in_motion:
+                dur = time_sec - motion_start
+                if dur >= config.motion_min_duration_sec:
+                    regions.append(Region(start=motion_start, end=time_sec, kind="motion"))
+                in_motion = False
+
+    # 最後がモーション中なら閉じる
+    if in_motion and motion_scores:
+        last_time = motion_scores[-1][0]
+        dur = last_time - motion_start
+        if dur >= config.motion_min_duration_sec:
+            regions.append(Region(start=motion_start, end=last_time, kind="motion"))
+
+    analyzed_sec = total_frames / src_fps
+    print(f"  フレーム分析: {total_frames} フレーム ({analyzed_sec:.0f}秒), サンプル間隔: {frame_skip}フレーム")
+    print(f"  モーション区間: {len(regions)} 個 (閾値: {config.motion_threshold}%)")
+    return regions
+
+
 # ===== Step 3: カット区間統合 & クリップ分割 =====
 
 def merge_regions(regions: list[Region], config: Config) -> list[Region]:
@@ -301,7 +393,7 @@ def export_clips(input_path: Path, output_dir: Path, clips: list[Clip], dry_run:
 
 # ===== Step 5: レポート =====
 
-def save_report(output_dir: Path, input_path: Path, total_dur: float, silence: list[Region], filler: list[Region], rephrase: list[Region], clips: list[Clip], dry_run: bool) -> Path:
+def save_report(output_dir: Path, input_path: Path, total_dur: float, silence: list[Region], filler: list[Region], rephrase: list[Region], clips: list[Clip], dry_run: bool, motion: list[Region] | None = None) -> Path:
     report = {
         "input": str(input_path),
         "dry_run": dry_run,
@@ -312,6 +404,7 @@ def save_report(output_dir: Path, input_path: Path, total_dur: float, silence: l
             "silence": {"count": len(silence), "total_sec": round(sum(r.duration for r in silence), 3)},
             "filler": {"count": len(filler), "total_sec": round(sum(r.duration for r in filler), 3)},
             "rephrase": {"count": len(rephrase), "total_sec": round(sum(r.duration for r in rephrase), 3)},
+            "motion_protected": {"count": len(motion or []), "total_sec": round(sum(r.duration for r in (motion or [])), 3)},
         },
         "clips": [{"index": c.index, "start_sec": round(c.start, 3), "end_sec": round(c.end, 3), "duration_sec": round(c.duration, 3)} for c in clips],
     }
@@ -330,6 +423,7 @@ def main():
     parser.add_argument("--output", default=None, help="出力先フォルダ（デフォルト: 入力ファイルの隣にclips/）")
     parser.add_argument("--config", default=str(Path(__file__).parent.parent / "configs" / "default.json"), help="設定JSONファイルパス")
     parser.add_argument("--silence-only", action="store_true", help="無音検出のみ（フィラー/言い直し検出をスキップ）")
+    parser.add_argument("--no-motion", action="store_true", help="モーション検出をスキップ（高速化）")
     parser.add_argument("--dry-run", action="store_true", help="ファイル書き出しなし、結果のみプレビュー")
     args = parser.parse_args()
 
@@ -360,8 +454,42 @@ def main():
     else:
         print("\n[Step 2] --silence-only: スキップ")
 
+    # ---- Step 2.5: モーション検出 ----
+    motion: list[Region] = []
+    if not args.no_motion and config.motion_protect:
+        try:
+            motion = detect_motion(input_path, config)
+        except Exception as e:
+            print(f"  ⚠️ モーション検出失敗: {e}")
+    elif args.no_motion:
+        print("\n[Step 2.5] --no-motion: スキップ")
+
     print("\n[Step 3] カット区間統合・クリップ算出...")
-    merged = merge_regions(silence + filler + rephrase, config)
+    cut_regions = silence + filler + rephrase
+    merged = merge_regions(cut_regions, config)
+
+    # モーション保護: 動きがある区間はカット対象から除外
+    if motion:
+        before_count = len(merged)
+        protected = []
+        for region in merged:
+            is_protected = False
+            for m in motion:
+                # カット区間がモーション区間と50%以上重なる場合は保護
+                overlap_start = max(region.start, m.start)
+                overlap_end = min(region.end, m.end)
+                if overlap_end > overlap_start:
+                    overlap_ratio = (overlap_end - overlap_start) / region.duration if region.duration > 0 else 0
+                    if overlap_ratio > 0.5:
+                        is_protected = True
+                        break
+            if not is_protected:
+                protected.append(region)
+        merged = protected
+        removed = before_count - len(merged)
+        if removed > 0:
+            print(f"  🛡️ モーション保護: {removed} カット区間を除外（動きあるシーン保護）")
+
     print(f"  統合後カット区間: {len(merged)} 個")
     clips = compute_clips(merged, total_dur, config)
     print(f"  出力クリップ数: {len(clips)}")
@@ -370,7 +498,7 @@ def main():
     export_clips(input_path, output_dir, clips, args.dry_run)
 
     print("\n[Step 5] レポート生成...")
-    save_report(output_dir, input_path, total_dur, silence, filler, rephrase, clips, args.dry_run)
+    save_report(output_dir, input_path, total_dur, silence, filler, rephrase, clips, args.dry_run, motion)
 
     cut_sec = sum(r.duration for r in silence + filler + rephrase)
     print(f"\n✅ 完了! カット: {cut_sec:.1f}秒 ({cut_sec/total_dur*100:.1f}%) → {len(clips)} クリップ")

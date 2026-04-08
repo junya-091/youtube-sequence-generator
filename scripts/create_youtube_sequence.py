@@ -117,8 +117,21 @@ ANALYSIS_SCHEMA = {
                 "required": ["title", "description"],
             },
         },
+        "transition_events": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "at_ms": {"type": "integer", "minimum": 0},
+                    "type": {"type": "string"},
+                    "duration_ms": {"type": "integer"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["at_ms", "type", "duration_ms", "reason"],
+            },
+        },
     },
-    "required": ["key_points", "sfx_events", "insert_events", "highlight", "thumbnail_ideas"],
+    "required": ["key_points", "sfx_events", "insert_events", "highlight", "thumbnail_ideas", "transition_events"],
 }
 
 
@@ -540,6 +553,7 @@ def analyze_with_gemini(
     insert_max = max(3, min(10, int(total_sec / 300)))  # 5分に1件、最大10件
     kp_min = max(5, int(total_sec / 20))               # 20秒に1件（最低件数）
     kp_max = kp_min + max(10, int(kp_min * 0.3))       # 余裕分を追加
+    transition_max = max(2, min(8, int(total_sec / 120)))  # 2分に1件、最大8件
 
     # minItems/maxItems は Gemini API スキーマ非対応のため削除し、件数指定はプロンプトのみで行う
     schema = copy.deepcopy(ANALYSIS_SCHEMA)
@@ -572,6 +586,13 @@ def analyze_with_gemini(
 3. insert_events: 画像インサートを挿入すべき場面。**最大{insert_max}件以内**に厳選すること。{insert_target_instruction}各インサートには start_ms（表示開始ms）・end_ms（表示終了ms、start_msより**最低3000ms以上**後）・prompt_en（画像生成用英語プロンプト）を返すこと。表示時間はシーンの内容・テンポに合わせて自然な長さにすること。prompt_en には必ず「Japanese style, set in Japan, featuring Japanese people」等の日本に関連する要素を含めること（外国人・英語テキスト・西洋的なビジュアルは使わない）
 4. highlight: ショート動画・切り抜き用として最も盛り上がる15秒前後の区間を1件。at_ms（開始ms）とduration_ms（10000〜20000msの範囲）、reason（選んだ理由・**日本語**で記述）を返すこと
 5. thumbnail_ideas: サムネイル画像の案を3件。title（視聴者の興味を引く煽りタイトル文・日本語）とdescription（画像の具体的な構図・人物・テキストの説明・日本語）を返すこと
+6. transition_events: シーン転換・話題変更時に適用するトランジション。**最大{transition_max}件**に厳選すること。
+   - type: "cross_dissolve"（柔らかいシーン転換・話題移行）, "dip_to_black"（大きな場面転換・冒頭/エンディング前後）, "dip_to_white"（強い感情・特別な瞬間）のいずれか
+   - at_ms: トランジションを配置するカットポイント（クリップ境界）のms値。クリップ情報の start_ms + duration_ms がクリップ境界
+   - duration_ms: トランジション長さ（500-2000ms。通常は1000ms。短いカットでは500ms、大きな場面転換では1500-2000ms）
+   - 全てのカット境界にトランジションを入れるのではなく、**話題の変化・場面の切り替わり**のみに限定すること
+   - 冒頭の挨拶後・エンディング前は dip_to_black が適切
+   - 通常の話題移行は cross_dissolve が基本
 
 指示:
 - at_ms はグローバルタイムライン上の絶対 ms 値
@@ -1321,7 +1342,8 @@ def main():
     if not sfx_dir:
         sfx_events = []
     insert_events = analysis.get("insert_events", []) if "insert" in enabled_steps else []
-    print(f"  key_points: {len(key_points)}, sfx_events: {len(sfx_events)}, insert_events: {len(insert_events)}")
+    transition_events = analysis.get("transition_events", [])
+    print(f"  key_points: {len(key_points)}, sfx_events: {len(sfx_events)}, insert_events: {len(insert_events)}, transitions: {len(transition_events)}")
     if sfx_dir and sfx_manifest["sfx"] and not sfx_events:
         print("  ⚠️ sfx ライブラリはあるが、分析結果の sfx_events は 0 件です")
     if sfx_events:
