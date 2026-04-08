@@ -30,8 +30,8 @@ from urllib.parse import quote
 DEFAULT_MODEL = str(Path.home() / "ggml-large-v3.bin")
 TEMPLATE_PATH = Path(__file__).parent.parent / "templates" / "base_sequence.xml"
 
-MAX_CHARS = 19           # SRT 1セグメント最大文字数
-MIN_DUR_MS = 1000        # SRT 最短表示時間 (ms)
+MAX_CHARS = 21           # SRT 1セグメント最大文字数 (WhisperX精度向上により19→21)
+MIN_DUR_MS = 700         # SRT 最短表示時間 (ms) (WhisperX精度向上により1000→700)
 INSERT_MIN_DURATION_MS = 3000  # インサート画像の最短表示時間 (ms)
 ZOOM_WINDOW_MS = 1200    # key_point 周辺のスケールアップ時間幅 (ms)
 
@@ -91,7 +91,7 @@ ANALYSIS_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "start_ms": {"type": "integer", "minimum": 0},
-                    "end_ms": {"type": "integer", "minimum": 3000},
+                    "end_ms": {"type": "integer", "minimum": 0},
                     "prompt_en": {"type": "string"},
                 },
                 "required": ["start_ms", "end_ms", "prompt_en"],
@@ -192,32 +192,93 @@ def get_clip_durations(clips: List[Path]) -> List[ClipInfo]:
     return results
 
 
-def concat_and_transcribe(clips_info: List[ClipInfo], model_path: str) -> List[Segment]:
-    """ffmpeg で全クリップを音声連結 → whisper-cli → Segment[] を返す"""
+def _concat_audio(clips_info: List[ClipInfo], out_wav: str) -> None:
+    """ffmpeg で全クリップを音声連結 → WAV (16kHz mono)"""
+    inputs = []
+    for c in clips_info:
+        inputs += ["-i", str(c.path)]
+    n = len(clips_info)
+    concat_filter = f"concat=n={n}:v=0:a=1[aout]"
+    subprocess.run(
+        ["ffmpeg", "-y"] + inputs +
+        ["-filter_complex", concat_filter, "-map", "[aout]",
+         "-ar", "16000", "-ac", "1", out_wav],
+        check=True, capture_output=True,
+    )
+
+
+def _transcribe_whisperx(wav_path: str) -> List[Segment]:
+    """WhisperX で文字起こし + forced alignment → Segment[]"""
+    import whisperx
+    import torch
+
+    device = "cpu"  # MPS は whisperx の一部で非対応のため CPU で安定動作
+    compute_type = "int8"  # M2 Air のメモリ節約
+
+    print("  🔊 WhisperX: モデルロード中...")
+    model = whisperx.load_model("large-v3", device, compute_type=compute_type, language="ja")
+
+    print("  🔊 WhisperX: 文字起こし中...")
+    audio = whisperx.load_audio(wav_path)
+    result = model.transcribe(audio, batch_size=4, language="ja")
+
+    # forced alignment でワードレベルタイムスタンプ取得
+    print("  🔊 WhisperX: アライメント中...")
+    try:
+        align_model, metadata = whisperx.load_align_model(language_code="ja", device=device)
+        result = whisperx.align(result["segments"], align_model, metadata, audio, device)
+    except Exception as e:
+        print(f"  ⚠️ WhisperX alignment 失敗（セグメントレベルで続行）: {e}")
+
+    # Segment[] に変換
+    segments = []
+    for i, seg in enumerate(result.get("segments", result if isinstance(result, list) else [])):
+        start_ms = int(seg.get("start", 0) * 1000)
+        end_ms = int(seg.get("end", 0) * 1000)
+        text = seg.get("text", "").strip()
+        if text:
+            segments.append(Segment(index=i + 1, start_ms=start_ms, end_ms=end_ms, text=text))
+
+    # メモリ解放
+    del model
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+    return segments
+
+
+def _transcribe_whisper_cli(wav_path: str, model_path: str) -> List[Segment]:
+    """whisper-cli フォールバック"""
     with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        inputs = []
-        for c in clips_info:
-            inputs += ["-i", str(c.path)]
-        n = len(clips_info)
-        concat_filter = f"concat=n={n}:v=0:a=1[aout]"
-        wav_path = str(tmpdir / "concat.wav")
-        subprocess.run(
-            ["ffmpeg", "-y"] + inputs +
-            ["-filter_complex", concat_filter, "-map", "[aout]",
-             "-ar", "16000", "-ac", "1", wav_path],
-            check=True, capture_output=True,
-        )
-        srt_prefix = str(tmpdir / "output")
+        srt_prefix = str(Path(tmpdir) / "output")
         subprocess.run(
             ["whisper-cli", "-m", model_path, "-f", wav_path,
-             "-l", "ja", "--output-srt", "-of", srt_prefix, "--max-len", "50"],
+             "-l", "ja", "--output-srt", "-of", srt_prefix, "--max-len", "40"],
             check=True,
         )
-        srt_path = tmpdir / "output.srt"
+        srt_path = Path(tmpdir) / "output.srt"
         if not srt_path.exists():
             raise RuntimeError("whisper-cli が SRT を生成しなかった")
         return _parse_srt(srt_path)
+
+
+def concat_and_transcribe(clips_info: List[ClipInfo], model_path: str) -> List[Segment]:
+    """ffmpeg で音声連結 → WhisperX (フォールバック: whisper-cli) → Segment[]"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        wav_path = str(Path(tmpdir) / "concat.wav")
+        _concat_audio(clips_info, wav_path)
+
+        # WhisperX を試行 → 失敗時は whisper-cli にフォールバック
+        try:
+            segments = _transcribe_whisperx(wav_path)
+            if segments:
+                print(f"  ✅ WhisperX 完了: {len(segments)} セグメント")
+                return segments
+            print("  ⚠️ WhisperX が空結果 → whisper-cli にフォールバック")
+        except Exception as e:
+            print(f"  ⚠️ WhisperX 失敗: {e} → whisper-cli にフォールバック")
+
+        return _transcribe_whisper_cli(wav_path, model_path)
 
 
 def _parse_srt(srt_path: Path) -> List[Segment]:
@@ -412,6 +473,38 @@ def _supplement_sfx(client, sfx_events, sfx_summary, segs_data, total_ms, sfx_mi
     return sfx_events
 
 
+def _validate_sfx_intervals(sfx_events: List[Dict], total_ms: int) -> List[Dict]:
+    """SFXイベントのポストプロセス検証: 40秒超ギャップ警告 + 2秒以内近接統合"""
+    if not sfx_events:
+        return sfx_events
+
+    sorted_events = sorted(sfx_events, key=lambda e: e["at_ms"])
+
+    # 2秒以内の近接イベント統合（後のイベントを削除）
+    merged = [sorted_events[0]]
+    for ev in sorted_events[1:]:
+        if ev["at_ms"] - merged[-1]["at_ms"] < 2000:
+            print(f"  ⚠️ sfx近接統合: {merged[-1]['at_ms']}ms と {ev['at_ms']}ms（差 {ev['at_ms'] - merged[-1]['at_ms']}ms）→ 後者を削除")
+        else:
+            merged.append(ev)
+
+    # 40秒超ギャップ警告
+    checkpoints = [0] + [e["at_ms"] for e in merged] + [total_ms]
+    gap_count = 0
+    for i in range(len(checkpoints) - 1):
+        gap = checkpoints[i + 1] - checkpoints[i]
+        if gap > 40000:
+            gap_count += 1
+            print(f"  ⚠️ sfxギャップ: {checkpoints[i]}ms〜{checkpoints[i+1]}ms（{gap // 1000}秒間 効果音なし）")
+    if gap_count:
+        print(f"  📊 40秒超ギャップ: {gap_count}箇所")
+
+    if len(merged) < len(sorted_events):
+        print(f"  📊 sfx近接統合: {len(sorted_events)}件 → {len(merged)}件")
+
+    return merged
+
+
 def analyze_with_gemini(
     segments: List[Segment],
     clips_info: List[ClipInfo],
@@ -554,14 +647,16 @@ def _refine_segments(segments: List[Segment]) -> List[Segment]:
         {"index": s.index, "start_ms": s.start_ms, "end_ms": s.end_ms, "text": s.text}
         for s in segments
     ]
-    prompt = f"""以下はwhisper.cppが生成した音声認識結果（JSON）です。タイムスタンプは正確です。
+    prompt = f"""以下はwhisper.cppが生成した音声認識結果（JSON）です。
+タイムスタンプはWhisperXのforced alignmentで単語レベルに正確です（±50ms程度）。
 以下のルールに従って修正し、JSON配列のみを返してください。
 
 ルール:
-1. start_ms/end_ms は原則変更しない
+1. start_ms/end_ms は原則変更しない（ただし明らかに不自然な区切りの場合は微調整可）
 2. 誤字脱字・不自然な表現を修正する
 3. 1セグメントが{MAX_CHARS}文字を超える場合、文字数比率で時間を比例配分して分割する
-4. 分割位置は助詞の直後または自然な文節の区切り
+4. 分割位置は**文節の区切り**を最優先する（「〜は」「〜が」「〜で」「〜を」などの助詞の直後）
+5. 助詞の途中や単語の途中で分割しない
 
 入力:
 {json.dumps(seg_list, ensure_ascii=False, indent=2)}
@@ -775,12 +870,24 @@ def build_fcp7_xml(
         etree.SubElement(tc, "displayformat").text = "DF" if ntsc_val == "TRUE" else "NDF"
         return tc
 
+    # ZOOM_WINDOW_MS 動的計算: 平均カット長に応じて調整
+    if clips_info:
+        avg_dur_ms = sum(c.duration_ms for c in clips_info) / len(clips_info)
+        if avg_dur_ms < 3000:
+            zoom_window = 800
+        elif avg_dur_ms > 8000:
+            zoom_window = 1500
+        else:
+            zoom_window = ZOOM_WINDOW_MS  # デフォルト 1200
+    else:
+        zoom_window = ZOOM_WINDOW_MS
+
     def _get_zoom_intervals(clip_idx: int, clip: ClipInfo):
         """key_points に基づくズーム区間 [(start_ms, end_ms), ...] を返す"""
         points = sorted(key_points_local.get(clip_idx, []))
         if not points:
             return []
-        half = ZOOM_WINDOW_MS // 2
+        half = zoom_window // 2
         intervals = []
         for point_ms in points:
             start = max(0, point_ms - half)
@@ -1099,7 +1206,22 @@ def main():
                         help="インサート画像のターゲット指定（例: '日本人女性20-40代、リアルな3D女性画像多め'）")
     parser.add_argument("--no-insert", action="store_true",
                         help="インサート画像の生成をスキップする")
+    parser.add_argument("--only", default=None,
+                        help="指定ステップのみ実行（カンマ区切り: sfx,zoom,insert,srt）")
+    parser.add_argument("--skip", default=None,
+                        help="指定ステップをスキップ（カンマ区切り: sfx,zoom,insert,srt）")
     args = parser.parse_args()
+
+    # --only / --skip の解決
+    valid_steps = {"sfx", "zoom", "insert", "srt"}
+    enabled_steps = set(valid_steps)
+    if args.only:
+        enabled_steps = {s.strip() for s in args.only.split(",") if s.strip() in valid_steps}
+        print(f"📋 --only 指定: {', '.join(sorted(enabled_steps))}")
+    if args.skip:
+        skip_steps = {s.strip() for s in args.skip.split(",") if s.strip() in valid_steps}
+        enabled_steps -= skip_steps
+        print(f"📋 --skip 指定: {', '.join(sorted(skip_steps))}")
 
     clips_dir = Path(args.clips)
     if not clips_dir.is_dir():
@@ -1192,16 +1314,20 @@ def main():
         print(f"  analysis_debug.json 保存: {debug_path}")
 
     key_points = analysis.get("key_points", [])
-    sfx_events = analysis.get("sfx_events", [])
+    sfx_events = analysis.get("sfx_events", []) if "sfx" in enabled_steps else []
     if not sfx_dir:
         sfx_events = []
-    insert_events = analysis.get("insert_events", [])
+    insert_events = analysis.get("insert_events", []) if "insert" in enabled_steps else []
     print(f"  key_points: {len(key_points)}, sfx_events: {len(sfx_events)}, insert_events: {len(insert_events)}")
     if sfx_dir and sfx_manifest["sfx"] and not sfx_events:
         print("  ⚠️ sfx ライブラリはあるが、分析結果の sfx_events は 0 件です")
+    if sfx_events:
+        sfx_events = _validate_sfx_intervals(sfx_events, total_dur_ms)
 
     # ---- Step 3: SRT (Step 2 の成否に依存しない) ----
-    if args.reuse_analysis:
+    if "srt" not in enabled_steps:
+        print("\n[Step 3] --only/--skip により SRT 生成スキップ")
+    elif args.reuse_analysis:
         print("\n[Step 3] --reuse-analysis: SRT 生成スキップ")
     else:
         print("\n[Step 3] SRT 生成中...")
@@ -1209,6 +1335,37 @@ def main():
         srt_path = out_dir / "captions.srt"
         srt_path.write_text(srt_content, encoding="utf-8")
         print(f"  ✅ captions.srt 保存: {srt_path}")
+
+    # ---- インサート画像バリデーション ----
+    if insert_events:
+        validated = []
+        seen_ranges = []
+        for ev in insert_events:
+            dur = ev.get("end_ms", 0) - ev.get("start_ms", 0)
+            # 表示時間を3s-15sにクランプ
+            if dur < 3000:
+                ev["end_ms"] = ev["start_ms"] + 3000
+                print(f"  ⚠️ インサート表示時間短すぎ → 3sに延長 (start_ms={ev['start_ms']})")
+            elif dur > 15000:
+                ev["end_ms"] = ev["start_ms"] + 15000
+                print(f"  ⚠️ インサート表示時間長すぎ → 15sにカット (start_ms={ev['start_ms']})")
+            # 重複排除（既存の範囲と50%以上重なる場合はスキップ）
+            overlap = False
+            for sr in seen_ranges:
+                o_start = max(ev["start_ms"], sr[0])
+                o_end = min(ev["end_ms"], sr[1])
+                if o_end > o_start:
+                    overlap_ratio = (o_end - o_start) / (ev["end_ms"] - ev["start_ms"])
+                    if overlap_ratio > 0.5:
+                        overlap = True
+                        print(f"  ⚠️ インサート重複排除: {ev['start_ms']}ms〜{ev['end_ms']}ms")
+                        break
+            if not overlap:
+                validated.append(ev)
+                seen_ranges.append((ev["start_ms"], ev["end_ms"]))
+        if len(validated) < len(insert_events):
+            print(f"  📊 インサート検証: {len(insert_events)}件 → {len(validated)}件")
+        insert_events = validated
 
     # ---- Step 4: 画像生成 ----
     if args.no_insert:

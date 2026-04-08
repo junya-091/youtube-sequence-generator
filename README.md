@@ -32,8 +32,10 @@ curl -L https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.
 ### Python パッケージ
 
 ```bash
-pip install google-genai lxml
+pip install google-genai lxml whisperx
 ```
+
+> WhisperX はオプションです。インストールされていない場合は自動で whisper-cli にフォールバックします。
 
 ### Gemini API キー（任意）
 
@@ -50,9 +52,16 @@ Gemini APIキーは [Google AI Studio](https://aistudio.google.com) で取得で
 ```
 youtube-sequence-generator/
 ├── scripts/
-│   ├── create_youtube_sequence.py     # メインスクリプト（Python）
-│   ├── convert_v2_to_adjustment.jsx   # Premiere用：V2を調整レイヤーに変換
-│   └── set_v2_scale.jsx               # Premiere用：トランスフォームスケール一括設定
+│   ├── create_youtube_sequence.py     # メインスクリプト（WhisperX対応）
+│   ├── auto_cut.py                    # 未カット素材の自動前処理
+│   ├── apply_zoom.jsx                 # Premiere用：ズーム一括適用（V2→調整レイヤー+スケール115%）
+│   ├── clip_alignment.jsx             # Premiere用：テロップ間ギャップ自動修正
+│   └── legacy/
+│       ├── convert_v2_to_adjustment.jsx
+│       └── set_v2_scale.jsx
+├── configs/
+│   ├── default.json                   # auto_cut.py デフォルト設定
+│   └── a_channel.json                 # Aチャンネル用設定
 └── templates/
     └── base_sequence.xml              # XMLテンプレート（スクリプトが自動参照）
 ```
@@ -88,6 +97,9 @@ GEMINI_MAX_IMAGE_COST_USD=2.0 python3 scripts/create_youtube_sequence.py \
 | `--insert-target` | インサート画像の生成指示（Gemini向けプロンプト） |
 | `--skip-whisper` | 既存の `segments.json` を再利用してWhisperをスキップ |
 | `--reuse-analysis` | 既存の `analysis_debug.json` を再利用して画像・XMLのみ再生成 |
+| `--no-insert` | インサート画像の生成をスキップ |
+| `--only sfx,srt,...` | 指定ステップのみ実行（sfx/zoom/insert/srt） |
+| `--skip sfx,srt,...` | 指定ステップをスキップ |
 
 ### 再実行フラグの使い分け
 
@@ -113,25 +125,28 @@ GEMINI_MAX_IMAGE_COST_USD=2.0 python3 scripts/create_youtube_sequence.py ...
 1. `File > Import` で `sequence.xml` を読み込む
 2. `captions.srt` を Import してキャプショントラックに変換
 
-### ズームエフェクトの適用（手動）
+### ズームエフェクトの適用（ワンクリック）
 
-Premiere Pro v26 ではExtendScript経由でのエフェクト自動適用が非対応のため、以下の手順で手動設定します。
+`apply_zoom.jsx` で3ステップを一括実行します。
 
-**Step 1: V2ブラックビデオを調整レイヤーに変換**
+1. Premiere Pro で YouTube Sequence を開く
+2. `apply_zoom.jsx` を Loader Script Panel で実行
+3. QE API 非対応の場合はダイアログの指示に従ってトランスフォームを手動追加 → 再実行
 
-1. `convert_v2_to_adjustment.jsx` を `~/Desktop/Adobe/` に置く
-2. Premiere Pro の「エクステンション」→「Loader Script Panel」を起動
-3. Scripts Manager から `convert_v2_to_adjustment` を実行
+> 旧手順の `convert_v2_to_adjustment.jsx` + `set_v2_scale.jsx` は `scripts/legacy/` に移動済み
 
-> Loader Script Panel は Adobe Exchange からインストールできます（無料）
+### 未カット素材の自動カット（新機能）
 
-**Step 2: トランスフォームエフェクトを一括適用**
+```bash
+# ドライラン（ファイル書き出しなし、結果プレビュー）
+python3 scripts/auto_cut.py --input /path/to/raw.mp4 --dry-run
 
-1. V2の調整レイヤーを1つ選択し、エフェクトパネルから「トランスフォーム」をドラッグ適用
-2. スケールを **115%** に設定
-3. `Cmd+C` でコピー → 残りのV2調整レイヤーを全選択 → `Cmd+Alt+V`（属性のペースト）
+# 本実行（clips/ にクリップ分割して出力）
+python3 scripts/auto_cut.py --input /path/to/raw.mp4
 
-> ⚠️ 「モーション」→「スケール」ではなく、必ず「**トランスフォーム**」エフェクトのスケールを使ってください。
+# 無音検出のみ（フィラー/言い直し検出をスキップ）
+python3 scripts/auto_cut.py --input /path/to/raw.mp4 --silence-only
+```
 
 ## 効果音フォルダの推奨構成
 

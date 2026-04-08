@@ -1,0 +1,9 @@
+{
+  "silence_threshold_db": -45,
+  "silence_min_duration_sec": 0.5,
+  "filler_words": ["えーと", "えー", "あの", "あのー", "まあ", "なんか", "うーん", "そのー", "ちょっと", "やっぱり"],
+  "detect_rephrase": true,
+  "padding_before_sec": 0.15,
+  "padding_after_sec": 0.10,
+  "min_clip_duration_sec": 2.0
+}
