@@ -262,21 +262,22 @@ def _transcribe_whisper_cli(wav_path: str, model_path: str) -> List[Segment]:
         return _parse_srt(srt_path)
 
 
-def concat_and_transcribe(clips_info: List[ClipInfo], model_path: str) -> List[Segment]:
-    """ffmpeg で音声連結 → WhisperX (フォールバック: whisper-cli) → Segment[]"""
+def concat_and_transcribe(clips_info: List[ClipInfo], model_path: str, use_whisperx: bool = False) -> List[Segment]:
+    """ffmpeg で音声連結 → whisper-cli (デフォルト) or WhisperX → Segment[]"""
     with tempfile.TemporaryDirectory() as tmpdir:
         wav_path = str(Path(tmpdir) / "concat.wav")
         _concat_audio(clips_info, wav_path)
 
-        # WhisperX を試行 → 失敗時は whisper-cli にフォールバック
-        try:
-            segments = _transcribe_whisperx(wav_path)
-            if segments:
-                print(f"  ✅ WhisperX 完了: {len(segments)} セグメント")
-                return segments
-            print("  ⚠️ WhisperX が空結果 → whisper-cli にフォールバック")
-        except Exception as e:
-            print(f"  ⚠️ WhisperX 失敗: {e} → whisper-cli にフォールバック")
+        if use_whisperx:
+            # WhisperX を試行 → 失敗時は whisper-cli にフォールバック
+            try:
+                segments = _transcribe_whisperx(wav_path)
+                if segments:
+                    print(f"  ✅ WhisperX 完了: {len(segments)} セグメント")
+                    return segments
+                print("  ⚠️ WhisperX が空結果 → whisper-cli にフォールバック")
+            except Exception as e:
+                print(f"  ⚠️ WhisperX 失敗: {e} → whisper-cli にフォールバック")
 
         return _transcribe_whisper_cli(wav_path, model_path)
 
@@ -1206,6 +1207,8 @@ def main():
                         help="インサート画像のターゲット指定（例: '日本人女性20-40代、リアルな3D女性画像多め'）")
     parser.add_argument("--no-insert", action="store_true",
                         help="インサート画像の生成をスキップする")
+    parser.add_argument("--use-whisperx", action="store_true",
+                        help="WhisperXで文字起こし（デフォルト: whisper-cli。精度高いが4倍遅い）")
     parser.add_argument("--only", default=None,
                         help="指定ステップのみ実行（カンマ区切り: sfx,zoom,insert,srt）")
     parser.add_argument("--skip", default=None,
@@ -1271,7 +1274,7 @@ def main():
             print(f"エラー: whisper モデルが見つからない: {model_path}")
             print(f"  ダウンロード: curl -L https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin -o {model_path}")
             sys.exit(1)
-        segments = concat_and_transcribe(clips_info, model_path)
+        segments = concat_and_transcribe(clips_info, model_path, use_whisperx=args.use_whisperx)
         print(f"  whisper セグメント数: {len(segments)}")
         seg_json = out_dir / "segments.json"
         seg_json.write_text(
