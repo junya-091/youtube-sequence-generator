@@ -201,7 +201,7 @@ start_ms/end_msはミリ秒単位。
             try:
                 print(f"  🤖 Gemini: フィラー検出中 ({chunk_start:.0f}s-{chunk_end:.0f}s)...")
                 resp = client.models.generate_content(
-                    model="gemini-2.0-flash",
+                    model="gemini-2.5-flash",
                     contents=prompt,
                     config={"response_mime_type": "application/json", "response_schema": schema},
                 )
