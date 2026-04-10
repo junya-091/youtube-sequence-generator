@@ -220,6 +220,375 @@ def _concat_audio(clips_info: List[ClipInfo], out_wav: str) -> None:
     )
 
 
+GEMINI_CHUNK_SEC = 300  # 5分ごとにチャンク分割（課金済み65Kトークン対応）
+
+
+def _transcribe_gemini(wav_path: str, max_chars: int = MAX_CHARS) -> List[Segment]:
+    """Gemini API で高精度文字起こし → Segment[]
+    戦略: 一括処理を試み、カバレッジ70%未満ならチャンク分割にフォールバック"""
+    from google import genai
+    from google.genai import types
+    import time as _time
+
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY / GOOGLE_API_KEY が未設定")
+
+    client = genai.Client(api_key=api_key, http_options={"timeout": 600000})
+
+    # 音声の総尺を取得
+    out = subprocess.check_output(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", wav_path],
+        text=True,
+    )
+    total_sec = float(json.loads(out)["format"]["duration"])
+    total_ms = int(total_sec * 1000)
+
+    # Phase 1: 一括処理を試行（最大2回）
+    for attempt in range(2):
+        print(f"  🤖 Gemini: 音声 {total_sec:.0f}秒 → 一括処理 (試行 {attempt + 1}/2)")
+        try:
+            segments = _transcribe_gemini_single(client, types, wav_path, 0, total_ms, max_chars)
+            if segments:
+                last_end = max(s.end_ms for s in segments)
+                coverage = last_end / total_ms
+                print(f"     カバレッジ: {coverage:.0%} ({len(segments)} セグメント)")
+                if coverage >= 0.7:
+                    print(f"  ✅ 一括処理成功")
+                    return segments
+                print(f"  ⚠️ カバレッジ不足 → ", end="")
+        except Exception as e:
+            print(f"  ⚠️ 失敗: {e} → ", end="")
+        if attempt == 0:
+            print("リトライ...")
+            _time.sleep(3)
+        else:
+            print("チャンク分割にフォールバック")
+
+    # Phase 2: チャンク分割
+    chunk_sec = GEMINI_CHUNK_SEC
+    chunk_count = max(1, int(total_sec / chunk_sec) + (1 if total_sec % chunk_sec > 30 else 0))
+    print(f"  🤖 Gemini: {chunk_count}チャンクに分割 ({chunk_sec}秒ごと)")
+
+    all_segments = []
+    for i in range(chunk_count):
+        start_sec = i * chunk_sec
+        end_sec = min((i + 1) * chunk_sec, total_sec)
+        chunk_dur_ms = int((end_sec - start_sec) * 1000)
+        offset_ms = int(start_sec * 1000)
+        print(f"\n  📎 チャンク {i+1}/{chunk_count}: {start_sec:.0f}s 〜 {end_sec:.0f}s")
+
+        # ffmpeg でチャンク切り出し
+        chunk_path = wav_path + f".chunk{i}.wav"
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", wav_path, "-ss", str(start_sec),
+             "-t", str(end_sec - start_sec), "-acodec", "pcm_s16le",
+             "-ar", "16000", "-ac", "1", chunk_path],
+            capture_output=True, check=True,
+        )
+
+        try:
+            chunk_segs = _transcribe_gemini_single(
+                client, types, chunk_path, offset_ms, chunk_dur_ms, max_chars)
+            all_segments.extend(chunk_segs)
+        except Exception as e:
+            print(f"  ❌ チャンク {i+1} 失敗: {e}")
+            raise
+        finally:
+            Path(chunk_path).unlink(missing_ok=True)
+
+    # インデックス振り直し・ソート
+    all_segments.sort(key=lambda s: s.start_ms)
+    for i, seg in enumerate(all_segments):
+        seg.index = i + 1
+
+    print(f"\n  ✅ Gemini 文字起こし完了（全チャンク統合）: {len(all_segments)} セグメント")
+    return all_segments
+
+
+def _transcribe_gemini_single(client, types, wav_path: str, offset_ms: int,
+                               chunk_dur_ms: int, max_chars: int = MAX_CHARS) -> List[Segment]:
+    """単一チャンク/一括をGeminiで文字起こし（リトライ付き・タイムスタンプバリデーション）"""
+    import time
+
+    uploaded = client.files.upload(file=wav_path)
+
+    prompt = f"""あなたは日本語の音声文字起こし専門家です。
+添付された音声ファイルを**最初から最後まで省略なく**SRT字幕形式で文字起こししてください。
+
+ルール:
+1. 1セグメントは最大{max_chars}文字以内
+2. 分割は文節の区切り（助詞「は」「が」「で」「を」「に」の直後、句読点、感嘆符）で行う
+3. 助詞や単語の途中で分割しない
+4. 話者が変わった場合、新しいセグメントを開始する
+5. 相槌・笑い声・フィラー（えー、あのー）も忠実に起こす
+6. 固有名詞・店名・地名は正確に表記する（グアム、IHOP、Tギャラリア等）
+7. タイムスタンプは音声に忠実に（±100ms以内）。00:00:00,000から開始すること
+8. 無音区間にはセグメントを作成しない
+9. 音声の最後まで必ず文字起こしすること。途中で省略しない
+10. 出力はSRT形式のみ。説明や注釈は不要
+11. テキストに半角スペースを入れない。日本語は詰めて書く（例: ×「めっちゃ アクティブ」→ ○「めっちゃアクティブ」）
+12. テキストに句読点「。」「、」は入れない
+
+出力例:
+1
+00:00:01,200 --> 00:00:03,500
+みんなさぁ
+
+2
+00:00:03,500 --> 00:00:05,800
+めっちゃアクティブじゃない？
+"""
+
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            print(f"     文字起こし中... (試行 {attempt + 1}/{max_retries})")
+            resp = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    types.Part.from_uri(file_uri=uploaded.uri, mime_type=uploaded.mime_type),
+                    prompt,
+                ],
+            )
+            srt_text = resp.text.strip()
+            segments = _parse_srt_text(srt_text)
+            if not segments:
+                if attempt < max_retries - 1:
+                    print("     ⚠️ 空結果 → リトライ...")
+                    time.sleep(3)
+                    continue
+                raise RuntimeError("空結果")
+
+            # タイムスタンプバリデーション: チャンク尺を超えるタイムスタンプをクランプ
+            # （Geminiが時:分:秒の桁を間違えた場合の対策）
+            margin_ms = chunk_dur_ms + 10000  # 10秒のマージン
+            clamped = 0
+            for seg in segments:
+                if seg.start_ms > margin_ms:
+                    seg.start_ms = min(seg.start_ms, chunk_dur_ms)
+                    clamped += 1
+                if seg.end_ms > margin_ms:
+                    seg.end_ms = min(seg.end_ms, chunk_dur_ms)
+                    clamped += 1
+                if seg.end_ms < seg.start_ms:
+                    seg.end_ms = seg.start_ms + 1000
+            if clamped > 0:
+                print(f"     ⚠️ タイムスタンプ補正: {clamped}件をクランプ")
+
+            # オフセット加算
+            for seg in segments:
+                seg.start_ms += offset_ms
+                seg.end_ms += offset_ms
+
+            # 文字数チェック
+            over = [s for s in segments if len(s.text) > max_chars]
+            if over:
+                print(f"     ⚠️ {max_chars}文字超: {len(over)}件 → ローカル分割")
+                segments = _local_split_segments(segments, max_chars)
+            print(f"     ✅ {len(segments)} セグメント")
+            return segments
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"     ⚠️ 失敗: {e} → リトライ...")
+                time.sleep(5)
+            else:
+                raise
+
+    raise RuntimeError("Gemini 文字起こし: 全試行失敗")
+
+
+def _parse_srt_text(srt_text: str) -> List[Segment]:
+    """SRT形式テキストをSegment[]にパース"""
+    # markdown fence を除去
+    srt_text = re.sub(r"^```[a-z]*\n?", "", srt_text.strip())
+    srt_text = re.sub(r"\n?```$", "", srt_text.strip())
+
+    blocks = [b.strip() for b in srt_text.split("\n\n") if b.strip()]
+    segs = []
+    for block in blocks:
+        lines = block.splitlines()
+        if len(lines) < 3:
+            continue
+        try:
+            idx = int(lines[0].strip())
+        except ValueError:
+            continue
+        ts_match = re.match(r"(\d{2}:\d{2}:\d{2}[,.:]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.:]\d{3})", lines[1])
+        if not ts_match:
+            continue
+        start_str = ts_match.group(1).replace(".", ",")
+        end_str = ts_match.group(2).replace(".", ",")
+        text = "".join(lines[2:]).strip()
+        # 半角スペース除去（日本語テキスト間のスペース）
+        text = re.sub(r'(?<=[^\x00-\x7F]) (?=[^\x00-\x7F])', '', text)
+        # 句読点除去
+        text = text.replace('。', '').replace('、', '')
+        if text:
+            segs.append(Segment(
+                index=idx,
+                start_ms=_parse_ts(start_str),
+                end_ms=_parse_ts(end_str),
+                text=text,
+            ))
+    return segs
+
+
+def _local_split_segments(segments: List[Segment], max_chars: int = MAX_CHARS) -> List[Segment]:
+    """Gemini不要のローカル文字数分割フォールバック。文節区切りで分割する"""
+    result = []
+    for seg in segments:
+        # 句読点・半角スペース除去
+        text = seg.text.replace('。', '').replace('、', '')
+        text = re.sub(r'(?<=[^\x00-\x7F]) (?=[^\x00-\x7F])', '', text)
+        seg = Segment(index=seg.index, start_ms=seg.start_ms, end_ms=seg.end_ms, text=text)
+
+        if len(seg.text) <= max_chars:
+            result.append(seg)
+            continue
+
+        # 分割候補位置を取得
+        split_points = _find_split_points(seg.text, max_chars)
+
+        if not split_points:
+            # 分割候補がない場合は文字数で強制分割
+            chunks = []
+            text = seg.text
+            while len(text) > max_chars:
+                chunks.append(text[:max_chars])
+                text = text[max_chars:]
+            if text:
+                chunks.append(text)
+        else:
+            # 分割候補を使って max_chars 以内にまとめる
+            chunks = []
+            prev = 0
+            for sp in split_points:
+                if sp - prev > max_chars and prev < sp:
+                    # この区間が長すぎる場合、前のチャンクを確定してから強制分割
+                    portion = seg.text[prev:sp]
+                    while len(portion) > max_chars:
+                        chunks.append(portion[:max_chars])
+                        portion = portion[max_chars:]
+                    if portion:
+                        chunks.append(portion)
+                    prev = sp
+                elif sp - prev > 0:
+                    chunks.append(seg.text[prev:sp])
+                    prev = sp
+            # 残り
+            if prev < len(seg.text):
+                remaining = seg.text[prev:]
+                if chunks and len(chunks[-1]) + len(remaining) <= max_chars:
+                    chunks[-1] += remaining
+                else:
+                    chunks.append(remaining)
+
+            # チャンクを再結合（短すぎるチャンクを隣接と結合）
+            merged_chunks = [chunks[0]] if chunks else []
+            for c in chunks[1:]:
+                if len(merged_chunks[-1]) + len(c) <= max_chars:
+                    merged_chunks[-1] += c
+                else:
+                    merged_chunks.append(c)
+            chunks = merged_chunks
+
+        # 時間を文字数比率で配分
+        total_chars = sum(len(c) for c in chunks)
+        dur_ms = seg.end_ms - seg.start_ms
+        current_ms = seg.start_ms
+        for chunk in chunks:
+            chunk_dur = int(dur_ms * len(chunk) / total_chars) if total_chars > 0 else dur_ms // len(chunks)
+            result.append(Segment(
+                index=0,
+                start_ms=current_ms,
+                end_ms=current_ms + chunk_dur,
+                text=chunk,
+            ))
+            current_ms += chunk_dur
+
+    # インデックス振り直し
+    for i, seg in enumerate(result):
+        seg.index = i + 1
+    return result
+
+
+# ---- janome形態素解析（オプション） ----
+try:
+    from janome.tokenizer import Tokenizer as _JanomeTokenizer
+    _JANOME = _JanomeTokenizer()
+    _HAS_JANOME = True
+except ImportError:
+    _HAS_JANOME = False
+
+
+def _find_split_points(text: str, max_chars: int) -> List[int]:
+    """文節区切りの分割候補位置を返す"""
+    if _HAS_JANOME:
+        return _find_split_points_janome(text, max_chars)
+    return _find_split_points_regex(text, max_chars)
+
+
+def _find_split_points_janome(text: str, max_chars: int) -> List[int]:
+    """janome形態素解析で文節境界を検出"""
+    tokens = list(_JANOME.tokenize(text))
+    points = []
+    pos = 0
+    for i, token in enumerate(tokens):
+        pos += len(token.surface)
+        if pos >= len(text):
+            break
+        part = token.part_of_speech.split(',')[0]
+        # 助詞・助動詞の直後を分割候補
+        if part in ('助詞', '助動詞'):
+            # 「ん」禁則: 次のトークンが「ん」で始まる場合はスキップ
+            if i + 1 < len(tokens) and tokens[i + 1].surface.startswith('ん'):
+                continue
+            points.append(pos)
+    return points
+
+
+def _find_split_points_regex(text: str, max_chars: int) -> List[int]:
+    """正規表現ベースの文節区切り検出（janome未インストール時のフォールバック）"""
+    # 助詞パターン（長いものから順にマッチ）
+    particles = r'(?:から|まで|より|ので|けど|って|ため|ながら|たら|ほど|ば|は|が|で|を|に|の|と|へ|も|や)'
+    # 助詞の直後で、かつ次が「ん」でない位置を分割候補にする
+    pattern = re.compile(particles + r'(?!ん)')
+    points = []
+    for m in pattern.finditer(text):
+        end_pos = m.end()
+        if 0 < end_pos < len(text):
+            points.append(end_pos)
+    return points
+
+
+def _merge_short_segments(segments: List[Segment]) -> List[Segment]:
+    """MIN_DUR_MS未満の短すぎるセグメントを隣接セグメントと結合"""
+    if not segments:
+        return segments
+
+    merged = [copy.copy(segments[0])]
+    for seg in segments[1:]:
+        dur = seg.end_ms - seg.start_ms
+        prev = merged[-1]
+        prev_dur = prev.end_ms - prev.start_ms
+        # 短すぎる場合は前のセグメントに結合（結合後もMAX_CHARS以下の場合のみ）
+        if dur < MIN_DUR_MS and len(prev.text) + len(seg.text) <= MAX_CHARS:
+            prev.end_ms = seg.end_ms
+            prev.text += seg.text
+        # 前のセグメントが短すぎて、今のセグメントに結合できる場合
+        elif prev_dur < MIN_DUR_MS and len(prev.text) + len(seg.text) <= MAX_CHARS:
+            prev.end_ms = seg.end_ms
+            prev.text += seg.text
+        else:
+            merged.append(copy.copy(seg))
+
+    # インデックス振り直し
+    for i, seg in enumerate(merged):
+        seg.index = i + 1
+    return merged
+
+
 def _transcribe_whisperx(wav_path: str) -> List[Segment]:
     """WhisperX で文字起こし + forced alignment → Segment[]"""
     import whisperx
@@ -275,22 +644,47 @@ def _transcribe_whisper_cli(wav_path: str, model_path: str) -> List[Segment]:
         return _parse_srt(srt_path)
 
 
-def concat_and_transcribe(clips_info: List[ClipInfo], model_path: str, use_whisperx: bool = False) -> List[Segment]:
-    """ffmpeg で音声連結 → whisper-cli (デフォルト) or WhisperX → Segment[]"""
+def concat_and_transcribe(clips_info: List[ClipInfo], model_path: str,
+                          fast: bool = False, experimental_gemini: bool = False) -> List[Segment]:
+    """ffmpeg で音声連結 → WhisperX(デフォルト) / whisper-cli(--fast) / Gemini(実験的) → Segment[]"""
     with tempfile.TemporaryDirectory() as tmpdir:
         wav_path = str(Path(tmpdir) / "concat.wav")
         _concat_audio(clips_info, wav_path)
 
-        if use_whisperx:
-            # WhisperX を試行 → 失敗時は whisper-cli にフォールバック
+        if experimental_gemini:
+            # Gemini API で文字起こし → 失敗時は自動フォールバック
             try:
-                segments = _transcribe_whisperx(wav_path)
-                if segments:
-                    print(f"  ✅ WhisperX 完了: {len(segments)} セグメント")
-                    return segments
-                print("  ⚠️ WhisperX が空結果 → whisper-cli にフォールバック")
+                segments = _transcribe_gemini(wav_path)
+                return segments
             except Exception as e:
-                print(f"  ⚠️ WhisperX 失敗: {e} → whisper-cli にフォールバック")
+                print(f"\n  ❌ Gemini 文字起こし失敗: {e}")
+                print("  → WhisperX に自動フォールバック")
+                try:
+                    segments = _transcribe_whisperx(wav_path)
+                    if segments:
+                        segments = _local_split_segments(segments, MAX_CHARS)
+                        print(f"  ✅ WhisperX + ローカル分割完了: {len(segments)} セグメント")
+                        return segments
+                except Exception as e2:
+                    print(f"  ⚠️ WhisperX も失敗: {e2} → whisper-cli へ")
+                segments = _transcribe_whisper_cli(wav_path, model_path)
+                segments = _local_split_segments(segments, MAX_CHARS)
+                print(f"  ✅ whisper-cli + ローカル分割完了: {len(segments)} セグメント")
+                return segments
+
+        if fast:
+            # --fast: whisper-cli で高速処理
+            return _transcribe_whisper_cli(wav_path, model_path)
+
+        # デフォルト: WhisperX（精度優先）→ 失敗時 whisper-cli フォールバック
+        try:
+            segments = _transcribe_whisperx(wav_path)
+            if segments:
+                print(f"  ✅ WhisperX 完了: {len(segments)} セグメント")
+                return segments
+            print("  ⚠️ WhisperX が空結果 → whisper-cli にフォールバック")
+        except Exception as e:
+            print(f"  ⚠️ WhisperX 失敗: {e} → whisper-cli にフォールバック")
 
         return _transcribe_whisper_cli(wav_path, model_path)
 
@@ -635,16 +1029,20 @@ def analyze_with_gemini(
     return {"key_points": [], "sfx_events": [], "insert_events": []}
 
 
-# ===== Step 3: SRT 生成 (max_chars=19, min_dur_ms=1000, mode=telop) =====
+# ===== Step 3: SRT 生成 (captionモード統一: 元タイムスタンプ尊重) =====
 
-def build_srt(segments: List[Segment], audio_dur_ms: int) -> str:
-    """テロップモード SRT を生成する。Gemini でテキスト修正後に telop タイミング適用"""
-    segments = _refine_segments(segments)
-    # telop: ギャップなしに再配置
-    for i in range(len(segments) - 1):
-        segments[i].end_ms = segments[i + 1].start_ms
-    if segments:
-        segments[-1].end_ms = audio_dur_ms
+def build_srt(segments: List[Segment], audio_dur_ms: int, skip_refine: bool = False) -> str:
+    """captionモード SRT を生成する。元のタイムスタンプを尊重し、無音区間にはテロップを表示しない"""
+    if skip_refine:
+        # Gemini文字起こし済み → refine スキップ
+        print("  ℹ️ Gemini文字起こし済み → refine スキップ")
+        segments = _merge_short_segments(_local_split_segments(segments))
+    else:
+        # WhisperX / whisper-cli → Geminiテキスト修正（失敗時はローカル分割）
+        segments = _refine_segments(segments)
+
+    # タイムスタンプバリデーション（昇順保証・重複除去）
+    segments = _validate_srt_timestamps(segments, audio_dur_ms)
 
     lines = []
     for i, seg in enumerate(segments, 1):
@@ -655,30 +1053,57 @@ def build_srt(segments: List[Segment], audio_dur_ms: int) -> str:
     return "\n".join(lines)
 
 
+def _validate_srt_timestamps(segments: List[Segment], audio_dur_ms: int) -> List[Segment]:
+    """SRTタイムスタンプのバリデーション: 昇順保証・尺超え防止・最小表示時間保証"""
+    if not segments:
+        return segments
+    result = []
+    for seg in sorted(segments, key=lambda s: s.start_ms):
+        # 尺を超えるセグメントをクランプ
+        seg.start_ms = min(seg.start_ms, audio_dur_ms)
+        seg.end_ms = min(seg.end_ms, audio_dur_ms)
+        # start >= end の不正セグメントをスキップ
+        if seg.end_ms <= seg.start_ms:
+            continue
+        # 前のセグメントと重複する場合は前のendを調整
+        if result and seg.start_ms < result[-1].end_ms:
+            result[-1].end_ms = seg.start_ms
+            if result[-1].end_ms <= result[-1].start_ms:
+                result.pop()
+        result.append(seg)
+    # インデックス振り直し
+    for i, seg in enumerate(result):
+        seg.index = i + 1
+    return result
+
+
 def _refine_segments(segments: List[Segment]) -> List[Segment]:
-    """Gemini Structured Outputs でテキストを修正・分割 (max_chars=19)"""
+    """Gemini Structured Outputs でテキストを修正・分割 → 失敗時はローカル分割フォールバック"""
+    import time as _time
     from google import genai
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        print("  ⚠️ GEMINI_API_KEY 未設定 - whisper テキストをそのまま使用")
-        return segments
+        print("  ⚠️ GEMINI_API_KEY 未設定 → ローカル分割で処理")
+        return _merge_short_segments(_local_split_segments(segments))
 
     client = genai.Client(api_key=api_key, http_options={"timeout": 300000})
     seg_list = [
         {"index": s.index, "start_ms": s.start_ms, "end_ms": s.end_ms, "text": s.text}
         for s in segments
     ]
-    prompt = f"""以下はwhisper.cppが生成した音声認識結果（JSON）です。
-タイムスタンプはWhisperXのforced alignmentで単語レベルに正確です（±50ms程度）。
+    prompt = f"""以下はWhisperXが生成した音声認識結果（JSON）です。
+タイムスタンプはforced alignmentで単語レベルに正確です（±50ms程度）。
 以下のルールに従って修正し、JSON配列のみを返してください。
 
 ルール:
-1. start_ms/end_ms は原則変更しない（ただし明らかに不自然な区切りの場合は微調整可）
+1. start_ms/end_ms は**変更しない**（タイムスタンプの正確性を維持）
 2. 誤字脱字・不自然な表現を修正する
-3. 1セグメントが{MAX_CHARS}文字を超える場合、文字数比率で時間を比例配分して分割する
-4. 分割位置は**文節の区切り**を最優先する（「〜は」「〜が」「〜で」「〜を」などの助詞の直後）
-5. 助詞の途中や単語の途中で分割しない
+3. 句読点「。」「、」は入れない。半角スペースも入れない
+4. 1セグメントが{MAX_CHARS}文字を超える場合、文字数比率で時間を比例配分して分割する
+5. 分割位置は**文節の区切り**を最優先する（「〜は」「〜が」「〜で」「〜を」などの助詞の直後）
+6. 助詞の途中や単語の途中で分割しない
+7. 「ん」の前で分割しない（例: 「なんぼ」→「な」+「んぼ」は不可）
 
 入力:
 {json.dumps(seg_list, ensure_ascii=False, indent=2)}
@@ -695,23 +1120,33 @@ def _refine_segments(segments: List[Segment]) -> List[Segment]:
             "required": ["text", "start_ms", "end_ms"],
         },
     }
-    try:
-        print("  🤖 Gemini: テキスト修正中...")
-        resp = client.models.generate_content(
-            model="gemini-3-flash-preview",
-            contents=prompt,
-            config={"response_mime_type": "application/json", "response_schema": schema},
-        )
-        raw = json.loads(resp.text)
-        result = [
-            Segment(index=i + 1, start_ms=int(r["start_ms"]),
-                    end_ms=int(r["end_ms"]), text=r["text"])
-            for i, r in enumerate(raw)
-        ]
-        return result if result else segments
-    except Exception as e:
-        print(f"  ⚠️ Gemini SRT refine 失敗: {e}")
-        return segments
+
+    # リトライ（指数バックオフ: 1s, 2s, 4s）
+    for attempt in range(3):
+        try:
+            print(f"  🤖 Gemini: テキスト修正中... (試行 {attempt + 1}/3)")
+            resp = client.models.generate_content(
+                model="gemini-3-flash-preview",
+                contents=prompt,
+                config={"response_mime_type": "application/json", "response_schema": schema},
+            )
+            raw = json.loads(resp.text)
+            result = [
+                Segment(index=i + 1, start_ms=int(r["start_ms"]),
+                        end_ms=int(r["end_ms"]), text=r["text"])
+                for i, r in enumerate(raw)
+            ]
+            if result:
+                return _merge_short_segments(result)
+        except Exception as e:
+            wait = 2 ** attempt
+            print(f"  ⚠️ Gemini SRT refine 失敗 (試行 {attempt + 1}/3): {e}")
+            if attempt < 2:
+                print(f"     {wait}秒後にリトライ...")
+                _time.sleep(wait)
+
+    print("  ⚠️ Gemini 全試行失敗 → ローカル分割にフォールバック")
+    return _merge_short_segments(_local_split_segments(segments))
 
 
 # ===== Step 4: インサート画像生成 =====
@@ -1228,8 +1663,15 @@ def main():
                         help="インサート画像のターゲット指定（例: '日本人女性20-40代、リアルな3D女性画像多め'）")
     parser.add_argument("--no-insert", action="store_true",
                         help="インサート画像の生成をスキップする")
+    parser.add_argument("--fast", action="store_true",
+                        help="whisper-cliで高速文字起こし（デフォルト: WhisperX精度優先）")
+    parser.add_argument("--experimental-gemini", action="store_true",
+                        help="[実験的] Gemini APIで文字起こし（短尺5分以下推奨・長尺は不安定）")
+    # 後方互換（非推奨・非表示）
     parser.add_argument("--use-whisperx", action="store_true",
-                        help="WhisperXで文字起こし（デフォルト: whisper-cli。精度高いが4倍遅い）")
+                        help="[非推奨] デフォルトがWhisperXになったため不要。無視されます")
+    parser.add_argument("--use-gemini-transcribe", action="store_true",
+                        help="[非推奨] --experimental-gemini を使用してください")
     parser.add_argument("--only", default=None,
                         help="指定ステップのみ実行（カンマ区切り: sfx,zoom,insert,srt）")
     parser.add_argument("--skip", default=None,
@@ -1295,7 +1737,15 @@ def main():
             print(f"エラー: whisper モデルが見つからない: {model_path}")
             print(f"  ダウンロード: curl -L https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin -o {model_path}")
             sys.exit(1)
-        segments = concat_and_transcribe(clips_info, model_path, use_whisperx=args.use_whisperx)
+        # 後方互換: --use-gemini-transcribe → --experimental-gemini
+        use_gemini = args.experimental_gemini or args.use_gemini_transcribe
+        if args.use_whisperx:
+            print("  ℹ️ --use-whisperx は非推奨（デフォルトがWhisperXになりました）")
+        if args.use_gemini_transcribe:
+            print("  ℹ️ --use-gemini-transcribe は非推奨。--experimental-gemini を使用してください")
+        segments = concat_and_transcribe(clips_info, model_path,
+                                         fast=args.fast,
+                                         experimental_gemini=use_gemini)
         print(f"  whisper セグメント数: {len(segments)}")
         seg_json = out_dir / "segments.json"
         seg_json.write_text(
@@ -1356,7 +1806,7 @@ def main():
         print("\n[Step 3] --reuse-analysis: SRT 生成スキップ")
     else:
         print("\n[Step 3] SRT 生成中...")
-        srt_content = build_srt(segments, total_dur_ms)
+        srt_content = build_srt(segments, total_dur_ms, skip_refine=use_gemini)
         srt_path = out_dir / "captions.srt"
         srt_path.write_text(srt_content, encoding="utf-8")
         print(f"  ✅ captions.srt 保存: {srt_path}")
@@ -1456,9 +1906,17 @@ def main():
         print(f"\n📋 レポート:\n{report_text}")
         print(f"  report.txt 保存: {report_path}")
 
-    print("\n✅ 完了!")
-    print(f"  出力先: {out_dir}")
-    print("  - captions.srt  : Premiere Pro で Import → caption track 化")
+    # ===== 処理完了サマリー =====
+    import time as _summary_time
+    engine = "Gemini" if use_gemini else ("whisper-cli (--fast)" if args.fast else "WhisperX")
+    print(f"\n{'='*50}")
+    print(f"✅ 完了!")
+    print(f"  文字起こしエンジン : {engine}")
+    print(f"  セグメント数       : {len(segments)}")
+    print(f"  合計尺             : {total_dur_ms / 1000:.1f}秒")
+    print(f"  出力先             : {out_dir}")
+    print(f"{'='*50}")
+    print("  - captions.srt  : Premiere Pro で Import → caption track 化（captionモード）")
     print("  - sequence.xml  : Premiere Pro で Import")
     print("  - sfx_manifest.json")
     if any(p is not None for p in insert_imgs):
