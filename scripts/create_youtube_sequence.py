@@ -35,7 +35,7 @@ MIN_DUR_MS = 700         # SRT 最短表示時間 (ms) (WhisperX精度向上に�
 INSERT_MIN_DURATION_MS = 3000  # インサート画像の最短表示時間 (ms)
 ZOOM_WINDOW_MS = 1200    # key_point 周辺のスケールアップ時間幅 (ms)
 
-PRICE_PER_IMAGE = 0.101  # $0.101/枚 (要確認: gemini-3.1-flash-image-preview / 2K)
+PRICE_PER_IMAGE = 0.101  # $0.101/枚 (gemini-3.1-flash-image / 2K / 標準ティア / 2026-08-31時点の公式料金表)
 MAX_IMAGE_COST = float(os.environ.get("GEMINI_MAX_IMAGE_COST_USD", "1.0"))
 
 # ===== データクラス =====
@@ -778,7 +778,7 @@ def build_sfx_manifest(sfx_dir: Path) -> Dict:
                 )
                 print(f"  🤖 Gemini: sfx タグ推定中 ({len(ids)} 件)...")
                 resp = client.models.generate_content(
-                    model="gemini-3-flash-preview",
+                    model="gemini-3.6-flash",
                     contents=prompt,
                     config={"response_mime_type": "application/json"},
                 )
@@ -858,7 +858,7 @@ def _supplement_sfx(client, sfx_events, sfx_summary, segs_data, total_ms, sfx_mi
         "required": ["sfx_events"],
     }
 
-    for model in ["gemini-3-flash-preview", "gemini-2.5-flash"]:
+    for model in ["gemini-3.6-flash", "gemini-2.5-flash"]:
         try:
             print(f"  🤖 Gemini: sfx補填中... ({model})")
             resp = client.models.generate_content(
@@ -1002,7 +1002,7 @@ def analyze_with_gemini(
 - pattern_id は任意フィールド。パターンに当てはまらない場面は省略してよい
 """
 
-    for model in ["gemini-3-flash-preview", "gemini-2.5-flash"]:
+    for model in ["gemini-3.6-flash", "gemini-2.5-flash"]:
         try:
             print(f"  🤖 Gemini: コンテンツ分析中... ({model})")
             resp = client.models.generate_content(
@@ -1126,7 +1126,7 @@ def _refine_segments(segments: List[Segment]) -> List[Segment]:
         try:
             print(f"  🤖 Gemini: テキスト修正中... (試行 {attempt + 1}/3)")
             resp = client.models.generate_content(
-                model="gemini-3-flash-preview",
+                model="gemini-3.6-flash",
                 contents=prompt,
                 config={"response_mime_type": "application/json", "response_schema": schema},
             )
@@ -1169,7 +1169,7 @@ def generate_insert_images(
 
     n = len(insert_list)
     cost = estimate_image_cost(n)
-    print(f"  📸 {n}枚 × ${PRICE_PER_IMAGE:.3f} = 推定 ${cost:.3f} USD (要確認)")
+    print(f"  📸 {n}枚 × ${PRICE_PER_IMAGE:.3f} = 推定 ${cost:.3f} USD (2K標準ティア換算)")
     if cost > MAX_IMAGE_COST:
         print(f"  ⛔ 推定コスト ${cost:.3f} が上限 ${MAX_IMAGE_COST} を超えるため中断")
         print(f"     環境変数 GEMINI_MAX_IMAGE_COST_USD で上限を変更できます")
@@ -1188,7 +1188,7 @@ def generate_insert_images(
                 from google.genai import types as genai_types
                 jp_suffix = ". Japanese style, set in Japan, featuring Japanese people and Japanese elements. No Western or foreign people, no English text."
                 resp = client.models.generate_content(
-                    model="gemini-3.1-flash-image-preview",
+                    model="gemini-3.1-flash-image",
                     contents=event["prompt_en"] + jp_suffix,
                     config=genai_types.GenerateContentConfig(
                         response_modalities=["IMAGE", "TEXT"],

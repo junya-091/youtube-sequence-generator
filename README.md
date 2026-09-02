@@ -35,7 +35,7 @@ curl -L https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.
 pip install google-genai lxml whisperx
 ```
 
-> WhisperX はオプションです。インストールされていない場合は自動で whisper-cli にフォールバックします。
+> WhisperX が標準の文字起こし経路です。未インストールや失敗時は自動で whisper-cli にフォールバックします。`--fast` を付けると最初から whisper-cli を使います。
 
 ### Gemini API キー（任意）
 
@@ -111,7 +111,7 @@ GEMINI_MAX_IMAGE_COST_USD=2.0 python3 scripts/create_youtube_sequence.py \
 
 ### コスト管理
 
-インサート画像の生成にはGemini APIを使います（1枚あたり約$0.10）。環境変数で上限を設定してください。
+インサート画像の生成にはGemini APIを使います（gemini-3.1-flash-image の2K画像・標準ティアで画像出力1枚あたり約$0.101、2026-08-31時点の公式料金表）。環境変数で上限を設定してください。
 
 ```bash
 # デフォルトは $1.0

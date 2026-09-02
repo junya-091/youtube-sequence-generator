@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 .sfx_tags_cache.json
 .DS_Store
+
+# ローカル作業用の素材・分析画像（公開しない）
+01_アナリティクス_BGM/
+02_サムネ/
