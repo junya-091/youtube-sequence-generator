@@ -1586,6 +1586,195 @@ def ms_to_clip_index(at_ms: int, clips_info: List[ClipInfo]) -> int:
     return len(clips_info) - 1
 
 
+# ===== 音量・BGM =====
+
+VOICE_PEAK_DB = -7.0      # 声のピーク目安 (-6〜-9dB)
+SFX_PEAK_DB = -16.5       # 効果音のピーク目安 (-15〜-18dB)
+BGM_PEAK_DB = -24.5       # 会話がない区間のBGMピーク目安 (-24〜-30dB)
+BGM_DUCK_PEAK_DB = -28.5  # 会話中のBGMピーク目安
+MAX_CLIP_GAIN_DB = 6.0    # Premiere のクリップ音量の上限 (+6dB)
+SILENT_DB = -60.0         # これより小さいピークは無音として扱う
+
+
+def _measure_peak_db(path: Path, start_ms: Optional[int] = None, dur_ms: Optional[int] = None) -> Optional[float]:
+    """ffmpeg の volumedetect でピーク (dBFS) を測る。音声がなければ None"""
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-v", "info"]
+    if start_ms is not None:
+        cmd += ["-ss", f"{start_ms / 1000:.3f}"]
+    if dur_ms is not None:
+        cmd += ["-t", f"{dur_ms / 1000:.3f}"]
+    cmd += ["-i", str(path), "-vn", "-af", "volumedetect", "-f", "null", "-"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    m = re.search(r"max_volume:\s*(-?[\d.]+|-inf) dB", r.stderr)
+    if not m:
+        return None
+    return -120.0 if m.group(1) == "-inf" else float(m.group(1))
+
+
+def _db_to_linear(db: float) -> float:
+    return 10 ** (db / 20)
+
+
+def plan_audio_levels(clips_info: List[ClipInfo], sfx_paths: Dict[str, Path],
+                      voice_db: float, sfx_db: float) -> Dict:
+    """声 (A1) と効果音 (A2) のピークを測り、目安に合わせるゲインを決める。
+    Premiere のクリップ音量は +6dB までなので、それ以上必要なものは一覧に残す"""
+    plan = {"voice": {}, "sfx": {}, "voice_short": [], "sfx_short": [], "voice_silent": [],
+            "voice_after": [], "sfx_after": []}
+    for i, c in enumerate(clips_info):
+        if not c.has_audio:
+            continue
+        peak = _measure_peak_db(c.path)
+        if peak is None or peak < SILENT_DB:
+            plan["voice_silent"].append(c.path.name)
+            continue
+        want = voice_db - peak
+        gain = min(want, MAX_CLIP_GAIN_DB)
+        plan["voice"][i] = round(gain, 2)
+        plan["voice_after"].append(peak + gain)
+        if want > MAX_CLIP_GAIN_DB + 0.05:
+            plan["voice_short"].append({"clip": c.path.name, "peak_db": round(peak, 1),
+                                        "need_db": round(want, 1)})
+    for sid, path in sfx_paths.items():
+        peak = _measure_peak_db(path)
+        if peak is None or peak < SILENT_DB:
+            continue
+        want = sfx_db - peak
+        gain = min(want, MAX_CLIP_GAIN_DB)
+        plan["sfx"][sid] = round(gain, 2)
+        plan["sfx_after"].append(peak + gain)
+        if want > MAX_CLIP_GAIN_DB + 0.05:
+            plan["sfx_short"].append({"clip": path.name, "peak_db": round(peak, 1), "need_db": round(want, 1)})
+    return plan
+
+
+def _speech_intervals(segments: List[Segment], total_ms: int, pad_before: int = 200,
+                      pad_after: int = 300, join_gap: int = 1500) -> List[Tuple[int, int]]:
+    """会話がある区間。前後に少し余裕を持たせ、短い間は1つにまとめる (BGMが細かく上下しないように)"""
+    spans = sorted((max(0, s.start_ms - pad_before), min(total_ms, s.end_ms + pad_after))
+                   for s in segments if s.end_ms > s.start_ms)
+    merged: List[List[int]] = []
+    for a, b in spans:
+        if merged and a - merged[-1][1] <= join_gap:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged]
+
+
+def render_bgm(bgm_path: Path, out_wav: Path, total_ms: int, speech: List[Tuple[int, int]],
+               bgm_db: float, duck_db: float, ramp_ms: int = 400,
+               fade_in_ms: int = 1000, fade_out_ms: int = 3000) -> Dict:
+    """BGM をループして全尺に敷き、会話中は自動で下げた WAV (48kHz/16bit/ステレオ) を書き出す。
+    下げ方は Premiere のキーフレームではなく、音そのものに焼き込む (XML で確実に再現させるため)"""
+    import wave
+    import numpy as np
+
+    src_peak = _measure_peak_db(bgm_path)
+    if src_peak is None or src_peak < SILENT_DB:
+        raise RuntimeError(f"BGM の音が取得できません: {bgm_path}")
+    g_open, g_duck = bgm_db - src_peak, duck_db - src_peak
+
+    # 音量の折れ線 (時刻 ms, dB)。会話の前後 ramp_ms で滑らかに上げ下げする。
+    # 会話区間は join_gap (> 2 * ramp_ms) 以上離れているので、上げ下げの区間は重ならない
+    pts: List[Tuple[float, float]] = []
+    for a, b in speech:
+        pts += [(a - ramp_ms, g_open), (a, g_duck), (b, g_duck), (b + ramp_ms, g_open)]
+    if not pts:
+        pts = [(0.0, g_open), (float(total_ms), g_open)]
+    tx = np.array([p[0] for p in pts]) / 1000.0
+    ty = np.array([p[1] for p in pts])
+
+    sr, ch = 48000, 2
+    total_samples = int(round(total_ms * sr / 1000))
+    proc = subprocess.Popen(
+        ["ffmpeg", "-nostdin", "-v", "error", "-stream_loop", "-1", "-i", str(bgm_path),
+         "-t", f"{total_ms / 1000:.6f}", "-f", "s16le", "-ac", str(ch), "-ar", str(sr), "-"],
+        stdout=subprocess.PIPE,
+    )
+    chunk = sr * 10  # 10秒ずつ処理
+    written = 0
+    with wave.open(str(out_wav), "wb") as w:
+        w.setnchannels(ch)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        while written < total_samples:
+            raw = proc.stdout.read(min(chunk, total_samples - written) * ch * 2)
+            if not raw:
+                break
+            x = np.frombuffer(raw, dtype=np.int16).astype(np.float32).reshape(-1, ch)
+            t = (written + np.arange(len(x))) / sr
+            gain = 10 ** (np.interp(t, tx, ty) / 20)
+            gain *= np.clip(t * 1000 / fade_in_ms, 0, 1) if fade_in_ms else 1
+            gain *= np.clip((total_ms / 1000 - t) * 1000 / fade_out_ms, 0, 1) if fade_out_ms else 1
+            y = np.clip(x * gain[:, None], -32768, 32767).astype(np.int16)
+            w.writeframes(y.tobytes())
+            written += len(x)
+        if written < total_samples:
+            w.writeframes(np.zeros((total_samples - written, ch), dtype=np.int16).tobytes())
+    proc.stdout.close()
+    proc.wait()
+
+    # 書き出した音を実測 (フェード部分を除いた、会話中/会話なしの最大ピーク)
+    def _peak_over(spans):
+        peaks = [_measure_peak_db(out_wav, a, b - a) for a, b in spans if b - a >= 500]
+        peaks = [p for p in peaks if p is not None]
+        return round(max(peaks), 1) if peaks else None
+    body = (fade_in_ms + ramp_ms, total_ms - fade_out_ms - ramp_ms)
+    duck_spans = [(max(a + ramp_ms, body[0]), min(b - ramp_ms, body[1])) for a, b in speech]
+    open_spans, cur = [], body[0]
+    for a, b in speech:
+        if a - ramp_ms > cur:
+            open_spans.append((cur, min(a - ramp_ms, body[1])))
+        cur = max(cur, b + ramp_ms)
+    if cur < body[1]:
+        open_spans.append((cur, body[1]))
+    return {
+        "source_peak_db": round(src_peak, 1),
+        "measured_open_db": _peak_over(open_spans),
+        "measured_duck_db": _peak_over(duck_spans),
+        "speech_spans": len(speech),
+    }
+
+
+def write_audio_report(out_dir: Path, plan: Optional[Dict], bgm: Optional[Dict],
+                       targets: Dict[str, float]) -> Path:
+    """音量の設定結果を audio_report.md に書き出す"""
+    md = ["# 音量の設定結果", "",
+          "XML の音量 (Audio Levels) は、各クリップのピークを ffmpeg で測って計算した値です。",
+          "Premiere で読み込んだあと、メーターで一度確認してください。", ""]
+    md += ["| 種類 | 目安 | 設定後のピーク |", "|---|---|---|"]
+    def _rng(vals):
+        return f"{min(vals):.1f}〜{max(vals):.1f}dB（{len(vals)}本）" if vals else "—"
+    if plan:
+        md.append(f"| 声 (A1) | {targets['voice']:.1f}dB | {_rng(plan['voice_after'])} |")
+        md.append(f"| 効果音 (A2) | {targets['sfx']:.1f}dB | {_rng(plan['sfx_after'])} |")
+    if bgm:
+        md.append(f"| BGM・会話なし (A3) | {targets['bgm']:.1f}dB | {bgm['measured_open_db']}dB（書き出した音を実測） |")
+        md.append(f"| BGM・会話中 (A3) | {targets['bgm_duck']:.1f}dB | {bgm['measured_duck_db']}dB（書き出した音を実測） |")
+    md.append("")
+    short = (plan or {}).get("voice_short", []) + (plan or {}).get("sfx_short", [])
+    if short:
+        md += ["## +6dB では目安に届かないクリップ", "",
+               "Premiere のクリップ音量は +6dB が上限です。下のクリップは +6dB にしてありますが、まだ小さいままです。",
+               "オーディオゲインで上げるか、音声を補正したファイルに差し替えてください。", "",
+               "| クリップ | 元のピーク | 必要なゲイン |", "|---|---|---|"]
+        md += [f"| {v['clip']} | {v['peak_db']}dB | +{v['need_db']}dB |" for v in short]
+        md.append("")
+    if plan and plan["voice_silent"]:
+        md += ["## 音が入っていないクリップ（音量は変更していません）", ""]
+        md += [f"- {n}" for n in plan["voice_silent"]]
+        md.append("")
+    if bgm:
+        md += ["## BGM", "",
+               f"- `bgm_ducked.wav` を A3 に配置。曲をループして全尺に敷き、会話中（{bgm['speech_spans']}区間）は自動で下げています",
+               "- 下げ方は音に焼き込んでいるため、Premiere 上のキーフレームはありません。BGM を変える場合は `--bgm` を変えて再実行してください",
+               "- 曲のつなぎ目（ループ位置）は自然になっていない場合があります。聴いて確認してください", ""]
+    path = out_dir / "audio_report.md"
+    path.write_text("\n".join(md), encoding="utf-8")
+    return path
+
+
 def build_fcp7_xml(
     clips_info: List[ClipInfo],
     key_points: List[Dict],
@@ -1594,8 +1783,14 @@ def build_fcp7_xml(
     sfx_manifest: Dict,
     sfx_dir: Optional[Path],
     insert_imgs: List[Optional[Path]],
+    audio_plan: Optional[Dict] = None,
+    bgm_wav: Optional[Path] = None,
 ) -> str:
-    """テンプレート差し替え方式で FCP7 XML を生成する"""
+    """テンプレート差し替え方式で FCP7 XML を生成する
+
+    audio_plan: plan_audio_levels() の結果。A1/A2 に音量 (Audio Levels) を入れる
+    bgm_wav:    render_bgm() で書き出した BGM。A3 に全尺で配置する
+    """
     from lxml import etree
 
     tree = etree.parse(str(TEMPLATE_PATH))
@@ -1748,6 +1943,26 @@ def build_fcp7_xml(
 
         return ci
 
+    def _level_filter(gain_db: float):
+        """クリップ音量 (Audio Levels)。value はリニア値 (1.0 = 0dB)"""
+        flt = etree.Element("filter")
+        eff = etree.SubElement(flt, "effect")
+        etree.SubElement(eff, "name").text = "Audio Levels"
+        etree.SubElement(eff, "effectid").text = "audiolevels"
+        etree.SubElement(eff, "effectcategory").text = "audiolevels"
+        etree.SubElement(eff, "effecttype").text = "audiolevels"
+        etree.SubElement(eff, "mediatype").text = "audio"
+        prm = etree.SubElement(eff, "parameter")
+        etree.SubElement(prm, "parameterid").text = "level"
+        etree.SubElement(prm, "name").text = "Level"
+        etree.SubElement(prm, "valuemin").text = "0"
+        etree.SubElement(prm, "valuemax").text = "3.98109"
+        etree.SubElement(prm, "value").text = f"{_db_to_linear(gain_db):.5f}"
+        return flt
+
+    voice_gain = (audio_plan or {}).get("voice", {})
+    sfx_gain = (audio_plan or {}).get("sfx", {})
+
     def _make_audio_clipitem(
         ci_id: str, clip: ClipInfo,
         tl_start_ms: int, tl_end_ms: int,
@@ -1809,6 +2024,8 @@ def build_fcp7_xml(
             src_in_ms=0, src_out_ms=clip.duration_ms,
             link_video_id=v_id, link_clipindex=clipindex,
         )
+        if i in voice_gain:
+            a_ci.append(_level_filter(voice_gain[i]))
         a1_track.append(a_ci)
         tl_cursor += clip.duration_ms
 
@@ -1979,8 +2196,39 @@ def build_fcp7_xml(
         src = etree.SubElement(ci, "sourcetrack")
         etree.SubElement(src, "mediatype").text = "audio"
         etree.SubElement(src, "trackindex").text = "1"
+        if event["sfx_id"] in sfx_gain:
+            ci.append(_level_filter(sfx_gain[event["sfx_id"]]))
 
         a2_track.append(ci)
+
+    # ---- A3: BGM (会話中に下げた音を書き出したもの) を全尺で配置 ----
+    if bgm_wav is not None:
+        a3_track = etree.SubElement(audio_elem, "track")
+        etree.SubElement(a3_track, "enabled").text = "TRUE"
+        etree.SubElement(a3_track, "locked").text = "FALSE"
+        frames = _ms_to_frames(tl_cursor, fps)
+        ci = etree.SubElement(a3_track, "clipitem")
+        ci.set("id", _next_id("bgm"))
+        etree.SubElement(ci, "name").text = bgm_wav.name
+        etree.SubElement(ci, "enabled").text = "TRUE"
+        etree.SubElement(ci, "duration").text = str(frames)
+        ci.append(_rate_elem(timebase, ntsc))
+        etree.SubElement(ci, "start").text = "0"
+        etree.SubElement(ci, "end").text = str(frames)
+        etree.SubElement(ci, "in").text = "0"
+        etree.SubElement(ci, "out").text = str(frames)
+        f_elem = etree.SubElement(ci, "file")
+        f_elem.set("id", "bgm-file-1")
+        etree.SubElement(f_elem, "name").text = bgm_wav.name
+        etree.SubElement(f_elem, "pathurl").text = _pathurl(bgm_wav)
+        f_elem.append(_rate_elem(timebase, ntsc))
+        etree.SubElement(f_elem, "duration").text = str(frames)
+        m = etree.SubElement(f_elem, "media")
+        aud = etree.SubElement(m, "audio")
+        etree.SubElement(aud, "channelcount").text = "2"
+        src = etree.SubElement(ci, "sourcetrack")
+        etree.SubElement(src, "mediatype").text = "audio"
+        etree.SubElement(src, "trackindex").text = "1"
 
     # sequence.duration を更新
     seq.find("duration").text = str(_ms_to_frames(tl_cursor, fps))
@@ -2019,6 +2267,18 @@ def main():
                         help="[非推奨] --experimental-gemini を使用してください")
     parser.add_argument("--caption-fix", choices=["apply", "propose", "off"], default="apply",
                         help="字幕の修正: apply=反映して一覧に残す(既定) / propose=字幕は元のまま修正案だけ一覧に出す / off=修正しない")
+    parser.add_argument("--bgm", default=None,
+                        help="BGMファイル。ループして全尺に敷き、会話中は自動で下げた bgm_ducked.wav を A3 に置く")
+    parser.add_argument("--voice-db", type=float, default=VOICE_PEAK_DB,
+                        help=f"声のピーク目安 dB（デフォルト {VOICE_PEAK_DB}。目安 -6〜-9）")
+    parser.add_argument("--sfx-db", type=float, default=SFX_PEAK_DB,
+                        help=f"効果音のピーク目安 dB（デフォルト {SFX_PEAK_DB}。目安 -15〜-18）")
+    parser.add_argument("--bgm-db", type=float, default=BGM_PEAK_DB,
+                        help=f"会話がない区間のBGMピーク dB（デフォルト {BGM_PEAK_DB}）")
+    parser.add_argument("--bgm-duck-db", type=float, default=BGM_DUCK_PEAK_DB,
+                        help=f"会話中のBGMピーク dB（デフォルト {BGM_DUCK_PEAK_DB}）")
+    parser.add_argument("--no-levels", action="store_true",
+                        help="声・効果音の音量をXMLに入れない（元の音量のまま）")
     parser.add_argument("--only", default=None,
                         help="指定ステップのみ実行（カンマ区切り: sfx,zoom,insert,srt）")
     parser.add_argument("--skip", default=None,
@@ -2221,6 +2481,54 @@ def main():
     else:
         print("\n[Step 4] insert_events なし - 画像生成スキップ")
 
+    # ---- 音量・BGM ----
+    audio_plan = None
+    bgm_wav = None
+    bgm_result = None
+    if not args.no_levels:
+        print("\n[音量] 声・効果音のピークを測定中...")
+        used_sfx: Dict[str, Path] = {}
+        if sfx_dir:
+            sfx_map = {s["id"]: s for s in sfx_manifest.get("sfx", [])}
+            for ev in sfx_events:
+                ent = sfx_map.get(ev.get("sfx_id"))
+                if ent and (sfx_dir / ent["relative_path"]).exists():
+                    used_sfx[ev["sfx_id"]] = sfx_dir / ent["relative_path"]
+        audio_plan = plan_audio_levels(clips_info, used_sfx, args.voice_db, args.sfx_db)
+        print(f"  声: {len(audio_plan['voice'])}本 / 効果音: {len(audio_plan['sfx'])}種類 に音量を設定")
+        if audio_plan["voice_short"]:
+            print(f"  ⚠️ +6dB では目安に届かないクリップ: {len(audio_plan['voice_short'])}本（audio_report.md 参照）")
+    if args.bgm:
+        bgm_src = Path(args.bgm).expanduser()
+        if not bgm_src.exists():
+            print(f"  ⚠️ BGMファイルが見つかりません: {bgm_src} - BGMなしで続行")
+        else:
+            speech_segs = segments
+            if not speech_segs and (out_dir / "segments.json").exists():
+                speech_segs = [Segment(index=s["index"], start_ms=s["start_ms"], end_ms=s["end_ms"], text=s["text"])
+                               for s in json.loads((out_dir / "segments.json").read_text(encoding="utf-8"))]
+            if not speech_segs:
+                print("  ⚠️ 会話の位置がわからないため、BGMは全体を会話中の音量にします")
+                speech = [(0, total_dur_ms)]
+            else:
+                speech = _speech_intervals(speech_segs, total_dur_ms)
+            print(f"\n[BGM] {bgm_src.name} をループして書き出し中（会話中 {len(speech)}区間は自動で下げる）...")
+            try:
+                bgm_wav = out_dir / "bgm_ducked.wav"
+                bgm_result = render_bgm(bgm_src, bgm_wav, total_dur_ms, speech, args.bgm_db, args.bgm_duck_db)
+                print(f"  ✅ bgm_ducked.wav 保存（実測: 会話なし {bgm_result['measured_open_db']}dB / "
+                      f"会話中 {bgm_result['measured_duck_db']}dB）")
+            except ImportError:
+                print("  ⚠️ BGMの書き出しには numpy が必要です（pip install numpy）- BGMなしで続行")
+                bgm_wav = None
+            except Exception as e:
+                print(f"  ⚠️ BGMの書き出しに失敗: {e} - BGMなしで続行")
+                bgm_wav = None
+    if audio_plan or bgm_result:
+        rp = write_audio_report(out_dir, audio_plan, bgm_result, {
+            "voice": args.voice_db, "sfx": args.sfx_db, "bgm": args.bgm_db, "bgm_duck": args.bgm_duck_db})
+        print(f"  ✅ audio_report.md 保存: {rp}")
+
     # ---- Step 5: FCP7 XML ----
     print("\n[Step 5] FCP7 XML 生成中...")
     try:
@@ -2232,6 +2540,8 @@ def main():
             sfx_manifest=sfx_manifest,
             sfx_dir=sfx_dir,
             insert_imgs=insert_imgs,
+            audio_plan=audio_plan,
+            bgm_wav=bgm_wav,
         )
         xml_path = out_dir / "sequence.xml"
         xml_path.write_text(xml_content, encoding="utf-8")
