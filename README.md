@@ -11,6 +11,8 @@ output/
 ├── caption_review.md     # 字幕の確認リスト（現状 → 修正 → 理由）
 ├── caption_review.json   # 修正箇所のマーカー（place_markers.jsx で読み込む）
 ├── sequence.xml          # FCP7 XML（Premiere ProにImport）
+├── audio_report.md       # 声・効果音・BGMの音量の設定結果
+├── bgm_ducked.wav        # 会話中に自動で下げたBGM（--bgm 指定時。A3に配置）
 ├── sfx_manifest.json     # 効果音タイミング（参照用）
 ├── segments.json         # 文字起こし結果（--skip-whisper で再利用）
 ├── analysis_debug.json   # Geminiの分析結果（--reuse-analysis・place_markers.jsx・add_transitions.jsx で使用）
@@ -112,6 +114,14 @@ GEMINI_MAX_IMAGE_COST_USD=2.0 python3 scripts/create_youtube_sequence.py \
 | `--sfx-dir` | 効果音フォルダのパス（省略時はA2トラックなし） |
 | `--insert-target` | インサート画像の生成指示（Gemini向けプロンプト） |
 | `--no-insert` | インサート画像の生成をスキップ |
+| `--size` | シーケンスのサイズ。`fhd`（1920×1080・デフォルト） / `vertical`（1080×1920） / `square`（1080×1080） / `4k` / `vertical-4k` / `幅x高さ`（例: `1080x1350`） |
+| `--fps` | シーケンスのfps（例: `23.976` / `29.97` / `30` / `59.94`）。省略時は最初のクリップのfps |
+| `--fit` | 素材とシーケンスのサイズが違う時の拡大方法。`fill`=画面いっぱい（はみ出しは切れる・デフォルト） / `fit`=全体が入る / `none`=100%のまま |
+| `--max-chars` | 字幕1枚の最大文字数（デフォルト: 横21 / 縦・正方形14） |
+| `--bgm` | BGMファイル。ループして全尺に敷き、会話中は自動で下げた `bgm_ducked.wav` をA3に配置 |
+| `--voice-db` / `--sfx-db` | 声・効果音のピーク目安（デフォルト -7.0 / -16.5 dB） |
+| `--bgm-db` / `--bgm-duck-db` | BGMのピーク目安。会話なし / 会話中（デフォルト -24.5 / -28.5 dB） |
+| `--no-levels` | 声・効果音の音量をXMLに入れない（元の音量のまま） |
 | `--caption-fix` | 字幕の修正方法。`apply`=Geminiの修正を反映して一覧に残す（デフォルト） / `propose`=字幕は音声認識のまま、修正案だけ一覧に出す / `off`=修正しない |
 | `--fast` | WhisperXを使わず、最初から whisper-cli で文字起こし（速いが字幕タイミングは文字数からの推定） |
 | `--model` | whisper.cppモデルのパス（デフォルト: `~/ggml-large-v3.bin`。WhisperXのフォールバック時にも使用） |
@@ -153,6 +163,39 @@ whisper-cli（`--fast`）やGemini文字起こしでは文字ごとの時刻が�
 クリップの長さは映像のフレーム数で計算し、文字起こし用の音声も各クリップを映像の長さに揃えてから連結します。
 
 以前はクリップの音声をそのまま連結していたため、AAC音声のクリップでは1本あたり約10msずつ音声が長くなり、クリップ数が多いほど後半の字幕・効果音・インサートが映像より遅れていました（テスト用の99クリップ・約4分20秒で約1.1秒）。音声のないクリップが混ざっていても無音として扱います。
+
+### 音量とBGM
+
+各クリップと効果音のピークを ffmpeg で測り、目安に合う音量（Audio Levels）を XML に入れます。
+
+| 種類 | 目安（デフォルト） | 入れ方 |
+|---|---|---|
+| 声（A1） | ピーク -7.0dB（-6〜-9dB） | クリップごとの音量 |
+| 効果音（A2） | ピーク -16.5dB（-15〜-18dB） | 効果音ファイルごとの音量 |
+| BGM（A3） | 会話なし -24.5dB / 会話中 -28.5dB | `bgm_ducked.wav` に焼き込み |
+
+- Premiere のクリップ音量は +6dB が上限です。それでも小さいクリップは `audio_report.md` に一覧で出ます。オーディオゲインで上げるか、補正した音声に差し替えてください
+- BGM は曲をループして全尺に敷き、`segments.json` の会話区間で自動的に下げます。下げ方は音そのものに焼き込むため、Premiere 上にキーフレームはできません
+- 曲のつなぎ目（ループ位置）が自然かどうかは、聴いて確認してください
+
+```bash
+python3 scripts/create_youtube_sequence.py --clips /path/to/clips --sfx-dir /path/to/sfx --bgm /path/to/bgm.mp3
+```
+
+### 縦動画・解像度・fps
+
+```bash
+# TikTok / Shorts / リール向け（1080×1920）
+python3 scripts/create_youtube_sequence.py --clips /path/to/clips --size vertical
+
+# 4K素材を 23.976fps の FHD シーケンスに
+python3 scripts/create_youtube_sequence.py --clips /path/to/clips --fps 23.976
+```
+
+- 素材とシーケンスのサイズが違う場合（横の素材を縦シーケンスに置く、4K素材をFHDに置くなど）は、画面いっぱいになるスケールを XML に入れます（`--fit` で変更可）。スマホの縦撮り素材は回転情報を読んで縦として扱います
+- 縦・正方形では、字幕1枚の文字数を14文字にします（`--max-chars` で変更可）
+- インサート画像はシーケンスの縦横比で生成し、引き伸ばさずに中央を切り抜いてサイズを合わせます
+- シーケンスと素材の fps が違う場合、フレームレートの変換は Premiere 側で行われます
 
 ### コスト管理
 
@@ -237,7 +280,7 @@ python3 scripts/auto_cut.py --input /path/to/raw.mp4 --config configs/a_channel.
 
 ## 動作確認環境
 
-- macOS（インサート画像の変換・リサイズに macOS の `sips` を使用）
+- macOS
 - Premiere Pro v26.0.0 (Build 72)
 - Python 3.13
 - whisper.cpp（`whisper-cli` コマンド）
