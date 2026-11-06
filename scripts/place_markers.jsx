@@ -1,10 +1,10 @@
 // place_markers.jsx  v1
 // Premiere Pro ExtendScript
-// analysis_debug.json または style_mapping.json を読み取り、シーケンスマーカーを配置
+// analysis_debug.json / caption_review.json / style_mapping.json を読み取り、シーケンスマーカーを配置
 //
 // 使い方:
 //   1. YouTube Sequence をアクティブにする
-//   2. JSON ファイルを選択（analysis_debug.json or style_mapping.json）
+//   2. JSON ファイルを選択（analysis_debug.json / caption_review.json / style_mapping.json）
 //   3. マーカーが配置される
 //
 // マーカーカラー:
@@ -17,6 +17,7 @@ var COLOR_MAP = {
     "transition": 6,     // Blue - トランジション
     "insert": 2,         // Purple - インサート
     "highlight": 4,      // Yellow - ハイライト
+    "caption_review": 5, // White - 字幕の修正箇所・修正案 (caption_review.json)
     // style_mapping.json のカテゴリ用
     "強調": 1,           // Red
     "ネガティブ": 6,     // Blue
@@ -57,7 +58,7 @@ function addSeqMarker(seq, timeSec, name, comment, colorIdx) {
         return;
     }
 
-    var jsonFile = File.openDialog("JSON ファイルを選択 (analysis_debug.json or style_mapping.json)", "JSON:*.json", false);
+    var jsonFile = File.openDialog("JSON ファイルを選択 (analysis_debug.json / caption_review.json / style_mapping.json)", "JSON:*.json", false);
     if (!jsonFile) return;
 
     var content = readFile(jsonFile.fsName);
@@ -128,6 +129,15 @@ function addSeqMarker(seq, timeSec, name, comment, colorIdx) {
             report += "highlight: 1 マーカー\n";
         }
     }
+    // caption_review.json 形式 (字幕の修正箇所・修正案)
+    else if (data.caption_review) {
+        for (var i = 0; i < data.caption_review.length; i++) {
+            var cr = data.caption_review[i];
+            addSeqMarker(seq, cr.at_ms / 1000, cr.name || "字幕:要確認", cr.comment || "", COLOR_MAP["caption_review"]);
+            count++;
+        }
+        report += "字幕の確認マーカー: " + data.caption_review.length + " 個\n";
+    }
     // style_mapping.json 形式 (配列 with category)
     else if (data.length !== undefined && data.length > 0 && data[0].category) {
         for (var i = 0; i < data.length; i++) {
@@ -141,7 +151,7 @@ function addSeqMarker(seq, timeSec, name, comment, colorIdx) {
         report += "テロップマーカー: " + data.length + " 個\n";
     } else {
         alert("エラー: 対応するJSON形式ではありません。\n" +
-              "analysis_debug.json または style_mapping.json を選択してください。");
+              "analysis_debug.json / caption_review.json / style_mapping.json のいずれかを選択してください。");
         return;
     }
 
