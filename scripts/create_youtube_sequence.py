@@ -39,6 +39,16 @@ ZOOM_WINDOW_MS = 1200    # key_point 周辺のスケールアップ時間幅 (ms
 PRICE_PER_IMAGE = 0.101  # $0.101/枚 (gemini-3.1-flash-image / 2K / 標準ティア / 2026-08-31時点の公式料金表)
 MAX_IMAGE_COST = float(os.environ.get("GEMINI_MAX_IMAGE_COST_USD", "1.0"))
 
+SIZE_PRESETS = {
+    "fhd": (1920, 1080),          # 横 (YouTube)
+    "vertical": (1080, 1920),     # 縦 (TikTok / Shorts / リール)
+    "square": (1080, 1080),
+    "4k": (3840, 2160),
+    "vertical-4k": (2160, 3840),
+}
+SEQ_WIDTH, SEQ_HEIGHT = SIZE_PRESETS["fhd"]  # main() で --size に合わせて上書きする
+VERTICAL_MAX_CHARS = 14  # 縦・正方形のときの字幕1枚あたりの最大文字数
+
 CAPTION_MODEL = "gemini-3.6-flash"  # 字幕テキスト修正に使うモデル
 CAPTION_BATCH = 120                 # 字幕修正を Gemini に送る1回あたりのセグメント数
 
@@ -62,6 +72,8 @@ class ClipInfo:
     fps: float
     start_ms: int      # タイムライン上での累積開始時刻 (ms)
     has_audio: bool = True
+    width: int = 0     # 表示上の幅 (スマホ縦撮りの回転を反映済み)
+    height: int = 0
 
 
 # ===== Gemini 分析スキーマ =====
@@ -175,8 +187,45 @@ def _pathurl(path: Path) -> str:
     return "file://localhost" + quote(p, safe="/")
 
 
-def _timecode_string(ntsc_val: str) -> str:
-    return "00:00:00;00" if ntsc_val == "TRUE" else "00:00:00:00"
+def _is_drop_frame(ntsc_val: str, timebase: Optional[int] = None) -> bool:
+    """ドロップフレーム表記は 29.97 / 59.94 だけ (23.976 などは NDF)"""
+    return ntsc_val == "TRUE" and (timebase is None or timebase in (30, 60))
+
+
+def _timecode_string(ntsc_val: str, timebase: Optional[int] = None) -> str:
+    return "00:00:00;00" if _is_drop_frame(ntsc_val, timebase) else "00:00:00:00"
+
+
+def _rate_of(fps: float) -> Tuple[int, str]:
+    """fps → (timebase, ntsc)。23.976→(24,TRUE)、29.97→(30,TRUE)、25→(25,FALSE)"""
+    tb = int(round(fps))
+    return tb, ("TRUE" if abs(fps - tb) > 0.01 else "FALSE")
+
+
+def parse_fps(text: str) -> float:
+    """'29.97' '30000/1001' '24' などを fps に。23.976/29.97/59.94 は正確な NTSC 値にする"""
+    if "/" in text:
+        n, d = text.split("/")
+        return float(n) / float(d)
+    v = float(text)
+    for tb in (24, 30, 48, 60, 120):
+        if abs(v - tb / 1.001) < 0.01:
+            return tb / 1.001
+    return v
+
+
+def parse_size(text: str) -> Tuple[int, int]:
+    """'vertical' などのプリセット名か '1080x1350' を (幅, 高さ) に"""
+    t = text.strip().lower()
+    if t in SIZE_PRESETS:
+        return SIZE_PRESETS[t]
+    m = re.fullmatch(r"(\d+)\s*[x×]\s*(\d+)", t)
+    if not m:
+        raise ValueError(f"--size は {', '.join(SIZE_PRESETS)} か 幅x高さ（例: 1080x1350）で指定してください: {text}")
+    w, h = int(m.group(1)), int(m.group(2))
+    if w % 2 or h % 2:
+        raise ValueError(f"--size の幅・高さは偶数にしてください: {text}")
+    return w, h
 
 
 def _detect_image_ext(data: bytes) -> str:
@@ -223,6 +272,18 @@ def get_clip_durations(clips: List[Path]) -> List[ClipInfo]:
         if not frames or frames <= 0:
             frames = int(round(fmt_dur * fps))
 
+        width = height = 0
+        if video:
+            width, height = int(video.get("width") or 0), int(video.get("height") or 0)
+            rotation = 0
+            for sd in video.get("side_data_list", []) or []:
+                if "rotation" in sd:
+                    rotation = int(float(sd["rotation"]))
+            if not rotation and str(video.get("tags", {}).get("rotate", "")).lstrip("-").isdigit():
+                rotation = int(video["tags"]["rotate"])
+            if abs(rotation) % 180 == 90:
+                width, height = height, width
+
         video_ms = frames * 1000.0 / fps
         start_ms = int(round(cumulative_ms))
         cumulative_ms += video_ms
@@ -230,7 +291,7 @@ def get_clip_durations(clips: List[Path]) -> List[ClipInfo]:
 
         results.append(ClipInfo(
             path=clip, duration_ms=end_ms - start_ms, fps=fps, start_ms=start_ms,
-            has_audio=audio is not None,
+            has_audio=audio is not None, width=width, height=height,
         ))
     return results
 
@@ -291,9 +352,10 @@ def _concat_audio(clips_info: List[ClipInfo], out_wav: str) -> None:
 GEMINI_CHUNK_SEC = 300  # 5分ごとにチャンク分割（課金済み65Kトークン対応）
 
 
-def _transcribe_gemini(wav_path: str, max_chars: int = MAX_CHARS) -> List[Segment]:
+def _transcribe_gemini(wav_path: str, max_chars: Optional[int] = None) -> List[Segment]:
     """Gemini API で高精度文字起こし → Segment[]
     戦略: 一括処理を試み、カバレッジ70%未満ならチャンク分割にフォールバック"""
+    max_chars = max_chars or MAX_CHARS
     from google import genai
     from google.genai import types
     import time as _time
@@ -375,8 +437,9 @@ def _transcribe_gemini(wav_path: str, max_chars: int = MAX_CHARS) -> List[Segmen
 
 
 def _transcribe_gemini_single(client, types, wav_path: str, offset_ms: int,
-                               chunk_dur_ms: int, max_chars: int = MAX_CHARS) -> List[Segment]:
+                               chunk_dur_ms: int, max_chars: Optional[int] = None) -> List[Segment]:
     """単一チャンク/一括をGeminiで文字起こし（リトライ付き・タイムスタンプバリデーション）"""
+    max_chars = max_chars or MAX_CHARS
     import time
 
     uploaded = client.files.upload(file=wav_path)
@@ -598,8 +661,9 @@ def _map_times(src_text: str, src_times: List[Tuple[int, int]], dst_text: str,
     return _fill_times(known, seg_start, seg_end)
 
 
-def _split_text(text: str, max_chars: int = MAX_CHARS) -> List[str]:
+def _split_text(text: str, max_chars: Optional[int] = None) -> List[str]:
     """max_chars 以内になるよう文節の区切りで分ける。返す配列をつなげると元の text になる"""
+    max_chars = max_chars or MAX_CHARS
     if len(text) <= max_chars:
         return [text] if text else []
 
@@ -677,9 +741,10 @@ def _seg_times(seg: Segment) -> Tuple[List[Tuple[int, int]], bool]:
     return _uniform_times(len(seg.text), seg.start_ms, seg.end_ms), True
 
 
-def _local_split_segments(segments: List[Segment], max_chars: int = MAX_CHARS) -> List[Segment]:
+def _local_split_segments(segments: List[Segment], max_chars: Optional[int] = None) -> List[Segment]:
     """Gemini不要のローカル分割。文節の区切りで分け、表示時刻は文字の時刻から決める。
     WhisperX の単語時刻がない時は、従来どおり文字数の比率で配分する"""
+    max_chars = max_chars or MAX_CHARS
     result: List[Segment] = []
     for seg in segments:
         times, _ = _seg_times(seg)
@@ -1499,7 +1564,8 @@ def estimate_image_cost(n: int) -> float:
 def generate_insert_images(
     insert_list: List[Dict], out_dir: Path
 ) -> List[Optional[Path]]:
-    """Gemini で画像生成 → PNG に正規化 → sips で 1920×1080 にリサイズ"""
+    """Gemini で画像生成 → ffmpeg でシーケンスのサイズ (SEQ_WIDTH×SEQ_HEIGHT) の PNG にする。
+    縦横比が違う場合は、引き伸ばさずに画面を覆うまで拡大して中央を切り抜く"""
     from google import genai
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1518,6 +1584,9 @@ def generate_insert_images(
 
     client = genai.Client(api_key=api_key, http_options={"timeout": 300000})
     results: List[Optional[Path]] = []
+    aspect = _aspect_label(SEQ_WIDTH, SEQ_HEIGHT)
+    orient = ("vertical" if SEQ_HEIGHT > SEQ_WIDTH else "square" if SEQ_HEIGHT == SEQ_WIDTH else "horizontal")
+    use_aspect_config = True  # 縦横比の指定が使えない環境では、プロンプトでの指示だけにする
 
     for i, event in enumerate(insert_list):
         out_path = out_dir / f"insert_{i + 1:03d}.png"
@@ -1528,13 +1597,20 @@ def generate_insert_images(
                     print(f"    🔄 {out_path.name} リトライ ({attempt}/2)...")
                 from google.genai import types as genai_types
                 jp_suffix = ". Japanese style, set in Japan, featuring Japanese people and Japanese elements. No Western or foreign people, no English text."
-                resp = client.models.generate_content(
-                    model="gemini-3.1-flash-image",
-                    contents=event["prompt_en"] + jp_suffix,
-                    config=genai_types.GenerateContentConfig(
-                        response_modalities=["IMAGE", "TEXT"],
-                    ),
-                )
+                jp_suffix += f" {orient.capitalize()} {aspect} composition."
+                cfg = {"response_modalities": ["IMAGE", "TEXT"]}
+                if use_aspect_config and aspect and hasattr(genai_types, "ImageConfig"):
+                    cfg["image_config"] = genai_types.ImageConfig(aspect_ratio=aspect)
+                try:
+                    resp = client.models.generate_content(
+                        model="gemini-3.1-flash-image",
+                        contents=event["prompt_en"] + jp_suffix,
+                        config=genai_types.GenerateContentConfig(**cfg),
+                    )
+                except Exception:
+                    if "image_config" in cfg:
+                        use_aspect_config = False  # 次の試行からは縦横比の指定なし
+                    raise
                 img_bytes = resp.candidates[0].content.parts[0].inline_data.data
                 raw_ext = _detect_image_ext(img_bytes)
                 raw_path = out_dir / f"insert_{i + 1:03d}{raw_ext}"
@@ -1544,23 +1620,7 @@ def generate_insert_images(
                 if out_path.exists() and raw_path != out_path:
                     out_path.unlink()
 
-                if raw_ext == ".png":
-                    final_input = raw_path
-                else:
-                    subprocess.run(
-                        ["sips", "-s", "format", "png", str(raw_path), "--out", str(out_path)],
-                        check=True, capture_output=True,
-                    )
-                    final_input = out_path
-
-                if final_input != out_path:
-                    out_path.write_bytes(final_input.read_bytes())
-
-                # sips で 1920×1080 にリサイズ (-z 高さ 幅)
-                subprocess.run(
-                    ["sips", "-z", "1080", "1920", str(out_path)],
-                    check=True, capture_output=True,
-                )
+                _fit_image(raw_path, out_path, SEQ_WIDTH, SEQ_HEIGHT)
                 if raw_path != out_path and raw_path.exists():
                     raw_path.unlink()
                 print(f"    ✅ {out_path.name}")
@@ -1574,6 +1634,25 @@ def generate_insert_images(
             results.append(None)
 
     return results
+
+
+def _aspect_label(w: int, h: int) -> Optional[str]:
+    """Gemini の画像生成で指定できる縦横比のうち、一番近いもの"""
+    choices = {"16:9": 16 / 9, "9:16": 9 / 16, "1:1": 1.0, "4:3": 4 / 3, "3:4": 3 / 4, "4:5": 4 / 5, "5:4": 5 / 4}
+    r = w / h
+    return min(choices, key=lambda k: abs(choices[k] - r))
+
+
+def _fit_image(src: Path, dst: Path, w: int, h: int) -> None:
+    """画像を w×h の PNG にする。縦横比が違う場合は、画面を覆うまで拡大して中央を切り抜く (引き伸ばさない)"""
+    tmp = dst.with_name(dst.stem + "_fit.png")
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(src),
+         "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}",
+         "-frames:v", "1", str(tmp)],
+        check=True, capture_output=True,
+    )
+    tmp.replace(dst)
 
 
 # ===== Step 5: FCP7 XML 生成 =====
@@ -1785,11 +1864,15 @@ def build_fcp7_xml(
     insert_imgs: List[Optional[Path]],
     audio_plan: Optional[Dict] = None,
     bgm_wav: Optional[Path] = None,
+    seq_fps: Optional[float] = None,
+    fit: str = "fill",
 ) -> str:
     """テンプレート差し替え方式で FCP7 XML を生成する
 
     audio_plan: plan_audio_levels() の結果。A1/A2 に音量 (Audio Levels) を入れる
     bgm_wav:    render_bgm() で書き出した BGM。A3 に全尺で配置する
+    seq_fps:    シーケンスの fps (省略時は最初のクリップの fps)
+    fit:        素材とシーケンスのサイズが違う時の拡大方法。fill=画面いっぱい / fit=全体が入る / none=100%のまま
     """
     from lxml import etree
 
@@ -1809,13 +1892,17 @@ def build_fcp7_xml(
     etree.SubElement(v2_track, "locked").text = "FALSE"
     a1_track, a2_track = audio_tracks[0], audio_tracks[1]
 
-    # fps / timebase / ntsc (全クリップ共通: 最初のクリップから取得)
-    fps = clips_info[0].fps if clips_info else 30.0
-    timebase = int(round(fps))
-    ntsc = "TRUE" if abs(fps - round(fps)) > 0.01 else "FALSE"
+    # fps / timebase / ntsc (シーケンス全体: --fps か、最初のクリップの fps)
+    fps = seq_fps or (clips_info[0].fps if clips_info else 30.0)
+    timebase, ntsc = _rate_of(fps)
 
-    # シーケンス・タイムコード・フォーマットの rate をクリップfpsで上書き
-    displayformat = "DF" if ntsc == "TRUE" else "NDF"
+    # シーケンスのサイズ (--size)
+    seq_sc = seq.find("media/video/format/samplecharacteristics")
+    seq_sc.find("width").text = str(SEQ_WIDTH)
+    seq_sc.find("height").text = str(SEQ_HEIGHT)
+
+    # シーケンス・タイムコード・フォーマットの rate を上書き
+    displayformat = "DF" if _is_drop_frame(ntsc, timebase) else "NDF"
     for elem in [
         seq.find("rate"),
         seq.find("timecode/rate"),
@@ -1829,7 +1916,7 @@ def build_fcp7_xml(
         df_elem.text = displayformat
     tc_string_elem = seq.find("timecode/string")
     if tc_string_elem is not None:
-        tc_string_elem.text = _timecode_string(ntsc)
+        tc_string_elem.text = _timecode_string(ntsc, timebase)
 
     # key_points をクリップごとのローカル時刻へ変換
     key_points_local: Dict[int, List[int]] = {}
@@ -1858,9 +1945,9 @@ def build_fcp7_xml(
     def _timecode_elem(tb: int, ntsc_val: str):
         tc = etree.Element("timecode")
         tc.append(_rate_elem(tb, ntsc_val))
-        etree.SubElement(tc, "string").text = _timecode_string(ntsc_val)
+        etree.SubElement(tc, "string").text = _timecode_string(ntsc_val, tb)
         etree.SubElement(tc, "frame").text = "0"
-        etree.SubElement(tc, "displayformat").text = "DF" if ntsc_val == "TRUE" else "NDF"
+        etree.SubElement(tc, "displayformat").text = "DF" if _is_drop_frame(ntsc_val, tb) else "NDF"
         return tc
 
     # ZOOM_WINDOW_MS 動的計算: 平均カット長に応じて調整
@@ -1910,21 +1997,18 @@ def build_fcp7_xml(
         etree.SubElement(ci, "enabled").text = "TRUE"
         etree.SubElement(ci, "duration").text = str(_ms_to_frames(src_out_ms - src_in_ms, fps))
         ci.append(_rate_elem(timebase, ntsc))
-        etree.SubElement(ci, "start").text = str(_ms_to_frames(tl_start_ms, fps))
-        etree.SubElement(ci, "end").text = str(_ms_to_frames(tl_end_ms, fps))
-        etree.SubElement(ci, "in").text = str(_ms_to_frames(src_in_ms, fps))
-        etree.SubElement(ci, "out").text = str(_ms_to_frames(src_out_ms, fps))
+        _append_range(ci, tl_start_ms, tl_end_ms, src_in_ms)
 
         p_str = str(clip.path.resolve())
         if p_str not in seen_files:
-            # 初回のみフル定義
+            # 初回のみフル定義 (file の rate・duration は素材そのもののfps)
             seen_files[p_str] = file_id
             f_elem = etree.SubElement(ci, "file")
             f_elem.set("id", file_id)
             etree.SubElement(f_elem, "name").text = clip.path.name
             etree.SubElement(f_elem, "pathurl").text = _pathurl(clip.path)
-            f_elem.append(_rate_elem(timebase, ntsc))
-            etree.SubElement(f_elem, "duration").text = str(_ms_to_frames(clip.duration_ms, fps))
+            f_elem.append(_rate_elem(*_rate_of(clip.fps)))
+            etree.SubElement(f_elem, "duration").text = str(_ms_to_frames(clip.duration_ms, clip.fps))
             m = etree.SubElement(f_elem, "media")
             etree.SubElement(m, "video")
             aud = etree.SubElement(m, "audio")
@@ -1942,6 +2026,41 @@ def build_fcp7_xml(
         etree.SubElement(lnk, "clipindex").text = str(link_clipindex)
 
         return ci
+
+    def _append_range(ci, tl_start_ms: int, tl_end_ms: int, src_in_ms: int):
+        """start/end/in/out。out は in + (end − start) にして、タイムライン上の長さと必ず一致させる"""
+        start_f = _ms_to_frames(tl_start_ms, fps)
+        end_f = _ms_to_frames(tl_end_ms, fps)
+        in_f = _ms_to_frames(src_in_ms, fps)
+        etree.SubElement(ci, "start").text = str(start_f)
+        etree.SubElement(ci, "end").text = str(end_f)
+        etree.SubElement(ci, "in").text = str(in_f)
+        etree.SubElement(ci, "out").text = str(in_f + end_f - start_f)
+
+    def _scale_for(clip: ClipInfo) -> Optional[float]:
+        """素材とシーケンスのサイズが違う時の拡大率 (%)。同じなら None"""
+        if fit == "none" or not clip.width or not clip.height:
+            return None
+        sx, sy = SEQ_WIDTH / clip.width, SEQ_HEIGHT / clip.height
+        scale = (max(sx, sy) if fit == "fill" else min(sx, sy)) * 100
+        return None if abs(scale - 100) < 0.01 else round(scale, 3)
+
+    def _motion_filter(scale_pct: float):
+        """Basic Motion (スケール)。Premiere ではモーションの「スケール」になる"""
+        flt = etree.Element("filter")
+        eff = etree.SubElement(flt, "effect")
+        etree.SubElement(eff, "name").text = "Basic Motion"
+        etree.SubElement(eff, "effectid").text = "basic"
+        etree.SubElement(eff, "effectcategory").text = "motion"
+        etree.SubElement(eff, "effecttype").text = "motion"
+        etree.SubElement(eff, "mediatype").text = "video"
+        prm = etree.SubElement(eff, "parameter")
+        etree.SubElement(prm, "parameterid").text = "scale"
+        etree.SubElement(prm, "name").text = "Scale"
+        etree.SubElement(prm, "valuemin").text = "0"
+        etree.SubElement(prm, "valuemax").text = "1000"
+        etree.SubElement(prm, "value").text = f"{scale_pct:g}"
+        return flt
 
     def _level_filter(gain_db: float):
         """クリップ音量 (Audio Levels)。value はリニア値 (1.0 = 0dB)"""
@@ -1975,10 +2094,7 @@ def build_fcp7_xml(
         etree.SubElement(ci, "enabled").text = "TRUE"
         etree.SubElement(ci, "duration").text = str(_ms_to_frames(src_out_ms - src_in_ms, fps))
         ci.append(_rate_elem(timebase, ntsc))
-        etree.SubElement(ci, "start").text = str(_ms_to_frames(tl_start_ms, fps))
-        etree.SubElement(ci, "end").text = str(_ms_to_frames(tl_end_ms, fps))
-        etree.SubElement(ci, "in").text = str(_ms_to_frames(src_in_ms, fps))
-        etree.SubElement(ci, "out").text = str(_ms_to_frames(src_out_ms, fps))
+        _append_range(ci, tl_start_ms, tl_end_ms, src_in_ms)
 
         # V1 で登録済みの file_id を参照
         p_str = str(clip.path.resolve())
@@ -1998,6 +2114,8 @@ def build_fcp7_xml(
 
         return ci
 
+    scaled_clips: List[Tuple[str, int, int, float]] = []
+
     # ---- V1 / A1: カット済みクリップを配置（分割なし）----
     # 開始位置は get_clip_durations が映像のフレーム数から計算した start_ms を使う
     # (ms の端数を足し続けると、クリップ数が多い時に1フレームの隙間・重なりが出るため)
@@ -2016,6 +2134,10 @@ def build_fcp7_xml(
             file_id=fid, link_audio_id=a_id,
             link_clipindex=clipindex,
         )
+        scale = _scale_for(clip)
+        if scale is not None:
+            v_ci.append(_motion_filter(scale))
+            scaled_clips.append((clip.path.name, clip.width, clip.height, scale))
         v1_track.append(v_ci)
 
         a_ci = _make_audio_clipitem(
@@ -2095,8 +2217,8 @@ def build_fcp7_xml(
             fsc_r = etree.SubElement(fsc, "rate")
             etree.SubElement(fsc_r, "timebase").text = str(timebase)
             etree.SubElement(fsc_r, "ntsc").text     = ntsc
-            etree.SubElement(fsc, "width").text            = "1920"
-            etree.SubElement(fsc, "height").text           = "1080"
+            etree.SubElement(fsc, "width").text            = str(SEQ_WIDTH)
+            etree.SubElement(fsc, "height").text           = str(SEQ_HEIGHT)
             etree.SubElement(fsc, "anamorphic").text       = "FALSE"
             etree.SubElement(fsc, "pixelaspectratio").text = "square"
             etree.SubElement(fsc, "fielddominance").text   = "none"
@@ -2140,15 +2262,15 @@ def build_fcp7_xml(
         etree.SubElement(f_elem, "pathurl").text = _pathurl(img_path)
         f_elem.append(_rate_elem(timebase, ntsc))
         etree.SubElement(f_elem, "duration").text = str(_ms_to_frames(dur_ms, fps))
-        etree.SubElement(f_elem, "width").text = "1920"
-        etree.SubElement(f_elem, "height").text = "1080"
+        etree.SubElement(f_elem, "width").text = str(SEQ_WIDTH)
+        etree.SubElement(f_elem, "height").text = str(SEQ_HEIGHT)
         f_elem.append(_timecode_elem(timebase, ntsc))
         m = etree.SubElement(f_elem, "media")
         v = etree.SubElement(m, "video")
         sc = etree.SubElement(v, "samplecharacteristics")
         sc.append(_rate_elem(timebase, ntsc))
-        etree.SubElement(sc, "width").text = "1920"
-        etree.SubElement(sc, "height").text = "1080"
+        etree.SubElement(sc, "width").text = str(SEQ_WIDTH)
+        etree.SubElement(sc, "height").text = str(SEQ_HEIGHT)
         etree.SubElement(sc, "anamorphic").text = "FALSE"
         etree.SubElement(sc, "pixelaspectratio").text = "square"
         etree.SubElement(sc, "fielddominance").text = "none"
@@ -2233,6 +2355,11 @@ def build_fcp7_xml(
     # sequence.duration を更新
     seq.find("duration").text = str(_ms_to_frames(tl_cursor, fps))
 
+    if scaled_clips:
+        sizes = sorted({f"{w}×{h}→{sc:g}%" for _, w, h, sc in scaled_clips})
+        print(f"  📐 シーケンス {SEQ_WIDTH}×{SEQ_HEIGHT} とサイズが違う素材 {len(scaled_clips)}本にスケールを設定"
+              f"（{fit}）: {', '.join(sizes)}")
+
 
     xml_bytes = etree.tostring(root, pretty_print=True, encoding="UTF-8")
     xml_str = xml_bytes.decode()
@@ -2243,6 +2370,7 @@ def build_fcp7_xml(
 # ===== メイン =====
 
 def main():
+    global SEQ_WIDTH, SEQ_HEIGHT, MAX_CHARS
     parser = argparse.ArgumentParser(description="YouTube用シーケンスを生成する")
     parser.add_argument("--clips", required=True, help="カット済みMP4フォルダのパス")
     parser.add_argument("--sfx-dir", default=None, help="効果音フォルダのパス（省略時 A2 なし）")
@@ -2267,6 +2395,14 @@ def main():
                         help="[非推奨] --experimental-gemini を使用してください")
     parser.add_argument("--caption-fix", choices=["apply", "propose", "off"], default="apply",
                         help="字幕の修正: apply=反映して一覧に残す(既定) / propose=字幕は元のまま修正案だけ一覧に出す / off=修正しない")
+    parser.add_argument("--size", default="fhd",
+                        help="シーケンスのサイズ: fhd(1920x1080・デフォルト) / vertical(1080x1920) / square / 4k / vertical-4k / 幅x高さ")
+    parser.add_argument("--fps", default=None,
+                        help="シーケンスのfps（例: 23.976 / 29.97 / 30 / 59.94）。省略時は最初のクリップのfps")
+    parser.add_argument("--fit", choices=["fill", "fit", "none"], default="fill",
+                        help="素材とシーケンスのサイズが違う時: fill=画面いっぱい(はみ出しは切れる・デフォルト) / fit=全体が入る / none=100%%のまま")
+    parser.add_argument("--max-chars", type=int, default=None,
+                        help=f"字幕1枚の最大文字数（デフォルト: 横 {MAX_CHARS} / 縦・正方形 {VERTICAL_MAX_CHARS}）")
     parser.add_argument("--bgm", default=None,
                         help="BGMファイル。ループして全尺に敷き、会話中は自動で下げた bgm_ducked.wav を A3 に置く")
     parser.add_argument("--voice-db", type=float, default=VOICE_PEAK_DB,
@@ -2284,6 +2420,16 @@ def main():
     parser.add_argument("--skip", default=None,
                         help="指定ステップをスキップ（カンマ区切り: sfx,zoom,insert,srt）")
     args = parser.parse_args()
+
+    # シーケンスのサイズ・fps・字幕の文字数
+    try:
+        SEQ_WIDTH, SEQ_HEIGHT = parse_size(args.size)
+        seq_fps = parse_fps(args.fps) if args.fps else None
+    except ValueError as e:
+        parser.error(str(e))
+    if seq_fps is not None and not 1 <= seq_fps <= 240:
+        parser.error(f"--fps の値が不正です: {args.fps}")
+    MAX_CHARS = args.max_chars or (VERTICAL_MAX_CHARS if SEQ_HEIGHT >= SEQ_WIDTH else MAX_CHARS)
 
     # --only / --skip の解決
     valid_steps = {"sfx", "zoom", "insert", "srt"}
@@ -2329,6 +2475,12 @@ def main():
     clip_timing_lines = report_clip_timing(clips_info)
     for line in clip_timing_lines:
         print(f"  ⏱ {line}")
+    out_fps = seq_fps or clips_info[0].fps
+    print(f"  シーケンス: {SEQ_WIDTH}×{SEQ_HEIGHT} / {out_fps:.3f}fps / 字幕は1枚{MAX_CHARS}文字まで")
+    other_fps = sorted({round(c.fps, 3) for c in clips_info if abs(c.fps - out_fps) > 0.01})
+    if other_fps:
+        print(f"  ℹ️ シーケンスと違うfpsの素材: {', '.join(f'{f:g}fps' for f in other_fps)}"
+              f"（{sum(1 for c in clips_info if abs(c.fps - out_fps) > 0.01)}本）。Premiere 側でフレームレートが変換されます")
 
     # 後方互換: --use-gemini-transcribe → --experimental-gemini
     use_gemini = args.experimental_gemini or args.use_gemini_transcribe
@@ -2542,6 +2694,8 @@ def main():
             insert_imgs=insert_imgs,
             audio_plan=audio_plan,
             bgm_wav=bgm_wav,
+            seq_fps=seq_fps,
+            fit=args.fit,
         )
         xml_path = out_dir / "sequence.xml"
         xml_path.write_text(xml_content, encoding="utf-8")
