@@ -12,6 +12,8 @@ output/
 ├── caption_review.json   # 修正箇所のマーカー（place_markers.jsx で読み込む）
 ├── sequence.xml          # FCP7 XML（Premiere ProにImport）
 ├── sfx_manifest.json     # 効果音タイミング（参照用）
+├── segments.json         # 文字起こし結果（--skip-whisper で再利用）
+├── analysis_debug.json   # Geminiの分析結果（--reuse-analysis・place_markers.jsx・add_transitions.jsx で使用）
 ├── report.txt            # ハイライト区間・サムネイル案
 └── inserts/
     ├── insert_001.png
@@ -38,6 +40,13 @@ curl -L https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.
 pip install google-genai lxml whisperx
 ```
 
+必要に応じて追加:
+
+```bash
+pip install janome                # 字幕を文節で分ける精度が上がる（なくても動作）
+pip install opencv-python numpy   # auto_cut.py の動き検出（なくても動作。--no-motion と同じ扱い）
+```
+
 > WhisperX が標準の文字起こし経路です。未インストールや失敗時は自動で whisper-cli にフォールバックします。`--fast` を付けると最初から whisper-cli を使います。
 
 ### Gemini API キー（任意）
@@ -58,15 +67,20 @@ youtube-sequence-generator/
 │   ├── create_youtube_sequence.py     # メインスクリプト（WhisperX対応）
 │   ├── auto_cut.py                    # 未カット素材の自動前処理
 │   ├── apply_zoom.jsx                 # Premiere用：ズーム一括適用（V2→調整レイヤー+スケール115%）
+│   ├── add_transitions.jsx            # Premiere用：analysis_debug.json の場面転換にトランジションを適用
+│   ├── place_markers.jsx              # Premiere用：JSONからシーケンスマーカーを配置
+│   ├── export_markers.jsx             # Premiere用：シーケンスマーカーをJSONに書き出し
+│   ├── delete_markers.jsx             # Premiere用：シーケンスマーカーを一括削除
 │   ├── clip_alignment.jsx             # Premiere用：テロップ間ギャップ自動修正
 │   └── legacy/
 │       ├── convert_v2_to_adjustment.jsx
 │       └── set_v2_scale.jsx
 ├── configs/
 │   ├── default.json                   # auto_cut.py デフォルト設定
-│   └── a_channel.json                 # Aチャンネル用設定
-└── templates/
-    └── base_sequence.xml              # XMLテンプレート（スクリプトが自動参照）
+│   └── a_channel.json                 # Aチャンネル用設定（--config で指定）
+├── templates/
+│   └── base_sequence.xml              # XMLテンプレート（スクリプトが自動参照）
+└── LICENSE                            # MIT License
 ```
 
 > **重要**: `scripts/` と `templates/` の位置関係を変えないでください。スクリプトが相対パスで `templates/base_sequence.xml` を参照しています。
@@ -93,17 +107,21 @@ GEMINI_MAX_IMAGE_COST_USD=2.0 python3 scripts/create_youtube_sequence.py \
 
 | オプション | 説明 |
 |---|---|
-| `--clips` | カット済みMP4フォルダのパス（必須） |
-| `--sfx-dir` | 効果音フォルダのパス（省略時はA2トラックなし） |
-| `--model` | whisper.cppモデルのパス（デフォルト: `~/ggml-large-v3.bin`） |
+| `--clips` | カット済みMP4/MOV/MXFフォルダのパス（必須） |
 | `--output` | 出力先フォルダ（デフォルト: `--clips/output/`） |
+| `--sfx-dir` | 効果音フォルダのパス（省略時はA2トラックなし） |
 | `--insert-target` | インサート画像の生成指示（Gemini向けプロンプト） |
-| `--skip-whisper` | 既存の `segments.json` を再利用してWhisperをスキップ |
-| `--caption-fix` | 字幕の修正方法。`apply`=Geminiの修正を反映して一覧に残す（デフォルト） / `propose`=字幕は音声認識のまま、修正案だけ一覧に出す / `off`=修正しない |
-| `--reuse-analysis` | 既存の `analysis_debug.json` を再利用して画像・XMLのみ再生成 |
 | `--no-insert` | インサート画像の生成をスキップ |
+| `--caption-fix` | 字幕の修正方法。`apply`=Geminiの修正を反映して一覧に残す（デフォルト） / `propose`=字幕は音声認識のまま、修正案だけ一覧に出す / `off`=修正しない |
+| `--fast` | WhisperXを使わず、最初から whisper-cli で文字起こし（速いが字幕タイミングは文字数からの推定） |
+| `--model` | whisper.cppモデルのパス（デフォルト: `~/ggml-large-v3.bin`。WhisperXのフォールバック時にも使用） |
+| `--experimental-gemini` | [実験的] Gemini APIで文字起こし（5分以下の短尺推奨。長尺は不安定） |
+| `--skip-whisper` | 既存の `segments.json` を再利用して文字起こしをスキップ |
+| `--reuse-analysis` | 既存の `analysis_debug.json` を再利用して画像・XMLのみ再生成（字幕は作り直さない） |
 | `--only sfx,srt,...` | 指定ステップのみ実行（sfx/zoom/insert/srt） |
 | `--skip sfx,srt,...` | 指定ステップをスキップ |
+
+> `--use-whisperx`（WhisperXがデフォルトになったため不要）と `--use-gemini-transcribe`（`--experimental-gemini` に変更）は後方互換のために残している非推奨オプションです。
 
 ### 再実行フラグの使い分け
 
@@ -163,7 +181,18 @@ GEMINI_MAX_IMAGE_COST_USD=2.0 python3 scripts/create_youtube_sequence.py ...
 
 > 旧手順の `convert_v2_to_adjustment.jsx` + `set_v2_scale.jsx` は `scripts/legacy/` に移動済み
 
-### 未カット素材の自動カット（新機能）
+### その他のPremiere用スクリプト
+
+どれも Loader Script Panel（または ExtendScript Toolkit）で、YouTube Sequence をアクティブにして実行します。
+
+| スクリプト | 用途 |
+|---|---|
+| `place_markers.jsx` | `analysis_debug.json`（ズーム・効果音・インサート・ハイライト）や `caption_review.json`（字幕の修正箇所）を選ぶと、該当位置にマーカーを配置 |
+| `add_transitions.jsx` | `analysis_debug.json` の場面転換の位置で、V1のクリップ境界にトランジションを適用 |
+| `clip_alignment.jsx` | テロップクリップ間の数フレームの隙間を詰める |
+| `export_markers.jsx` / `delete_markers.jsx` | マーカーのJSON書き出し / 一括削除 |
+
+### 未カット素材の自動カット
 
 ```bash
 # ドライラン（ファイル書き出しなし、結果プレビュー）
@@ -174,7 +203,21 @@ python3 scripts/auto_cut.py --input /path/to/raw.mp4
 
 # 無音検出のみ（フィラー/言い直し検出をスキップ）
 python3 scripts/auto_cut.py --input /path/to/raw.mp4 --silence-only
+
+# チャンネル用の設定を使う / 動き検出をスキップして速くする
+python3 scripts/auto_cut.py --input /path/to/raw.mp4 --config configs/a_channel.json --no-motion
 ```
+
+| オプション | 説明 |
+|---|---|
+| `--input` | 入力動画ファイル（必須） |
+| `--output` | 出力先フォルダ（デフォルト: 入力ファイルの隣の `clips/`） |
+| `--config` | 設定JSON（デフォルト: `configs/default.json`）。無音の基準・フィラーワード・前後の余白など |
+| `--silence-only` | 無音検出のみ（フィラー/言い直し検出をスキップ） |
+| `--no-motion` | 動き検出をスキップ（高速化） |
+| `--dry-run` | ファイルを書き出さず、結果だけ表示 |
+
+> フィラーワードは自動でカットされます。「ちょっと」「やっぱり」のように意味のある言葉としても使う語を入れると、話の内容まで削れることがあるので、`--dry-run` で確認してから本実行してください。
 
 ## 効果音フォルダの推奨構成
 
@@ -194,8 +237,12 @@ python3 scripts/auto_cut.py --input /path/to/raw.mp4 --silence-only
 
 ## 動作確認環境
 
-- macOS
+- macOS（インサート画像の変換・リサイズに macOS の `sips` を使用）
 - Premiere Pro v26.0.0 (Build 72)
 - Python 3.13
 - whisper.cpp（`whisper-cli` コマンド）
 - FFmpeg
+
+## ライセンス
+
+[MIT License](LICENSE)
