@@ -14,6 +14,7 @@ MP4クリップフォルダから以下を生成する:
 
 import argparse
 import copy
+import difflib
 import json
 import os
 import re
@@ -22,7 +23,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 # ===== 定数 =====
@@ -38,6 +39,9 @@ ZOOM_WINDOW_MS = 1200    # key_point 周辺のスケールアップ時間幅 (ms
 PRICE_PER_IMAGE = 0.101  # $0.101/枚 (gemini-3.1-flash-image / 2K / 標準ティア / 2026-08-31時点の公式料金表)
 MAX_IMAGE_COST = float(os.environ.get("GEMINI_MAX_IMAGE_COST_USD", "1.0"))
 
+CAPTION_MODEL = "gemini-3.6-flash"  # 字幕テキスト修正に使うモデル
+CAPTION_BATCH = 120                 # 字幕修正を Gemini に送る1回あたりのセグメント数
+
 # ===== データクラス =====
 
 @dataclass
@@ -46,14 +50,18 @@ class Segment:
     start_ms: int
     end_ms: int
     text: str
+    # text と1文字ずつ対応する (start_ms, end_ms)。
+    # WhisperX の alignment 結果がある時だけ入る。None の時は文字数から時刻を推定する
+    char_ms: Optional[List[Tuple[int, int]]] = None
 
 
 @dataclass
 class ClipInfo:
     path: Path
-    duration_ms: int
+    duration_ms: int   # タイムライン上の長さ (映像のフレーム数から計算)
     fps: float
-    start_ms: int  # タイムライン上での累積開始時刻 (ms)
+    start_ms: int      # タイムライン上での累積開始時刻 (ms)
+    has_audio: bool = True
 
 
 # ===== Gemini 分析スキーマ =====
@@ -182,9 +190,14 @@ def _detect_image_ext(data: bytes) -> str:
 # ===== Step 1: クリップ情報取得・音声連結・文字起こし =====
 
 def get_clip_durations(clips: List[Path]) -> List[ClipInfo]:
-    """各 MP4 の長さ (ms) と fps を取得し、累積 start_ms を計算する"""
+    """各クリップの長さ・fps を取得し、タイムライン上の開始位置を計算する。
+
+    長さは「映像のフレーム数」で決める。Premiere のタイムライン上の長さは映像で決まるため。
+    コンテナの長さ (format.duration) は音声の方が長いクリップで映像より長くなり、
+    クリップ数が増えるほど XML の配置と文字起こしの時刻がずれる原因になる。
+    """
     results = []
-    cumulative = 0
+    cumulative_ms = 0.0
     for clip in clips:
         out = subprocess.check_output(
             ["ffprobe", "-v", "quiet", "-print_format", "json",
@@ -192,32 +205,87 @@ def get_clip_durations(clips: List[Path]) -> List[ClipInfo]:
             text=True,
         )
         data = json.loads(out)
-        dur_ms = int(round(float(data["format"]["duration"]) * 1000))
+        streams = data.get("streams", [])
+        video = next((s for s in streams if s.get("codec_type") == "video"), None)
+        audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+        fmt_dur = float(data.get("format", {}).get("duration", 0) or 0)
+
         fps = 30.0
-        for stream in data.get("streams", []):
-            if stream.get("codec_type") == "video":
-                r_fps = stream.get("r_frame_rate", "30/1")
-                num, den = r_fps.split("/")
+        frames = None
+        if video:
+            num, den = video.get("r_frame_rate", "30/1").split("/")
+            if float(den) > 0 and float(num) > 0:
                 fps = float(num) / float(den)
-                break
-        results.append(ClipInfo(path=clip, duration_ms=dur_ms, fps=fps, start_ms=cumulative))
-        cumulative += dur_ms
+            if video.get("duration"):
+                frames = int(round(float(video["duration"]) * fps))
+            elif video.get("nb_frames", "").isdigit():
+                frames = int(video["nb_frames"])
+        if not frames or frames <= 0:
+            frames = int(round(fmt_dur * fps))
+
+        video_ms = frames * 1000.0 / fps
+        start_ms = int(round(cumulative_ms))
+        cumulative_ms += video_ms
+        end_ms = int(round(cumulative_ms))
+
+        results.append(ClipInfo(
+            path=clip, duration_ms=end_ms - start_ms, fps=fps, start_ms=start_ms,
+            has_audio=audio is not None,
+        ))
     return results
 
 
+def report_clip_timing(clips_info: List[ClipInfo]) -> List[str]:
+    """クリップの長さの扱いを表示用の行で返す"""
+    if not clips_info:
+        return []
+    lines = [f"クリップの長さは映像のフレーム数で計算し、文字起こし用の音声も各クリップを映像の長さに揃えて連結しています（{len(clips_info)}本）"]
+    no_audio = [c for c in clips_info if not c.has_audio]
+    if no_audio:
+        lines.append(f"音声のないクリップ: {len(no_audio)}本（無音として扱います）")
+    return lines
+
+
 def _concat_audio(clips_info: List[ClipInfo], out_wav: str) -> None:
-    """ffmpeg で全クリップを音声連結 → WAV (16kHz mono)"""
+    """ffmpeg で全クリップを音声連結 → WAV (16kHz mono)
+
+    各クリップの音声を、タイムライン上の長さ (映像の長さ) にぴったり揃えてから連結する。
+    揃えずに連結すると、音声が映像より長いクリップ (AAC など) の差が積み重なり、
+    後半ほど字幕・効果音・インサートの時刻が XML の映像とずれる。
+    """
     inputs = []
-    for c in clips_info:
-        inputs += ["-i", str(c.path)]
+    filters = []
+    for k, c in enumerate(clips_info):
+        d = f"{c.duration_ms / 1000:.6f}"
+        if c.has_audio:
+            inputs += ["-i", str(c.path)]
+        else:
+            inputs += ["-f", "lavfi", "-t", d, "-i", "anullsrc=r=16000:cl=mono"]
+        filters.append(
+            f"[{k}:a:0]aformat=sample_rates=16000:channel_layouts=mono,"
+            f"asetpts=PTS-STARTPTS,atrim=duration={d},apad=whole_dur={d},"
+            f"asetpts=PTS-STARTPTS[a{k}]"
+        )
     n = len(clips_info)
-    concat_filter = f"concat=n={n}:v=0:a=1[aout]"
+    labels = "".join(f"[a{k}]" for k in range(n))
+    filter_complex = ";".join(filters) + f";{labels}concat=n={n}:v=0:a=1[aout]"
     subprocess.run(
         ["ffmpeg", "-y"] + inputs +
-        ["-filter_complex", concat_filter, "-map", "[aout]",
+        ["-filter_complex", filter_complex, "-map", "[aout]",
          "-ar", "16000", "-ac", "1", out_wav],
         check=True, capture_output=True,
     )
+
+    # 連結後の長さがタイムラインと一致しているか確認
+    try:
+        got = float(subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", out_wav], text=True).strip())
+        expected = (clips_info[-1].start_ms + clips_info[-1].duration_ms) / 1000
+        if abs(got - expected) * 1000 > 1000.0 / clips_info[0].fps:
+            print(f"  ⚠️ 連結音声の長さ {got:.3f}s がタイムライン {expected:.3f}s と1フレーム以上ずれています")
+    except Exception:
+        pass
 
 
 GEMINI_CHUNK_SEC = 300  # 5分ごとにチャンク分割（課金済み65Kトークン対応）
@@ -434,80 +502,191 @@ def _parse_srt_text(srt_text: str) -> List[Segment]:
     return segs
 
 
-def _local_split_segments(segments: List[Segment], max_chars: int = MAX_CHARS) -> List[Segment]:
-    """Gemini不要のローカル文字数分割フォールバック。文節区切りで分割する"""
-    result = []
-    for seg in segments:
-        # 句読点・半角スペース除去
-        text = seg.text.replace('。', '').replace('、', '')
-        text = re.sub(r'(?<=[^\x00-\x7F]) (?=[^\x00-\x7F])', '', text)
-        seg = Segment(index=seg.index, start_ms=seg.start_ms, end_ms=seg.end_ms, text=text)
+def _is_ja_space(text: str, i: int) -> bool:
+    """日本語の文字どうしの間にある半角スペースか"""
+    return (text[i] == " " and 0 < i < len(text) - 1
+            and ord(text[i - 1]) > 0x7F and ord(text[i + 1]) > 0x7F)
 
-        if len(seg.text) <= max_chars:
-            result.append(seg)
+
+def _clean_caption_text(text: str, times: Optional[List[Tuple[int, int]]] = None):
+    """句読点「。」「、」と、日本語どうしの間の半角スペースを除く。
+    times (1文字ごとの時刻) を渡すと、同じ位置の時刻も一緒に除いて返す"""
+    keep = [i for i, ch in enumerate(text) if ch not in "。、" and not _is_ja_space(text, i)]
+    new_text = "".join(text[i] for i in keep)
+    new_times = [times[i] for i in keep] if times is not None else None
+    return new_text, new_times
+
+
+def _fill_times(known: List[Optional[Tuple[int, int]]], seg_start: int, seg_end: int) -> List[Tuple[int, int]]:
+    """時刻がわからない文字 (None) を、前後のわかっている文字の時刻から均等に埋める"""
+    n = len(known)
+    out: List[Tuple[int, int]] = []
+    i = 0
+    prev_end = seg_start
+    while i < n:
+        if known[i] is not None:
+            s, e = known[i]
+            s = max(s, prev_end) if out else s
+            e = max(e, s)
+            out.append((s, e))
+            prev_end = e
+            i += 1
             continue
+        j = i
+        while j < n and known[j] is None:
+            j += 1
+        right = known[j][0] if j < n else seg_end
+        right = max(right, prev_end)
+        k = j - i
+        for t in range(k):
+            a = prev_end + (right - prev_end) * t // k
+            b = prev_end + (right - prev_end) * (t + 1) // k
+            out.append((a, b))
+        prev_end = right
+        i = j
+    return out
 
-        # 分割候補位置を取得
-        split_points = _find_split_points(seg.text, max_chars)
 
-        if not split_points:
-            # 分割候補がない場合は文字数で強制分割
-            chunks = []
-            text = seg.text
-            while len(text) > max_chars:
-                chunks.append(text[:max_chars])
-                text = text[max_chars:]
-            if text:
-                chunks.append(text)
+def _uniform_times(n: int, start: int, end: int) -> List[Tuple[int, int]]:
+    """文字数で均等に時刻を割り振る (単語時刻がない時の推定)"""
+    return _fill_times([None] * n, start, end)
+
+
+def _char_ms_from_words(text: str, words: List[Dict], seg_start: int, seg_end: int) -> Optional[List[Tuple[int, int]]]:
+    """WhisperX の words (日本語は1文字ずつ) から、text の各文字の時刻を作る。
+    alignment できなかった文字 (数字・記号など) は前後から埋める。1文字も取れなければ None"""
+    src_chars: List[str] = []
+    src_times: List[Optional[Tuple[int, int]]] = []
+    for w in words:
+        word = str(w.get("word", ""))
+        if not word:
+            continue
+        if "start" in w and "end" in w and w["start"] is not None and w["end"] is not None:
+            ws, we = int(float(w["start"]) * 1000), int(float(w["end"]) * 1000)
+            for t in _uniform_times(len(word), ws, max(we, ws)):
+                src_times.append(t)
         else:
-            # 分割候補を使って max_chars 以内にまとめる
-            chunks = []
-            prev = 0
-            for sp in split_points:
-                if sp - prev > max_chars and prev < sp:
-                    # この区間が長すぎる場合、前のチャンクを確定してから強制分割
-                    portion = seg.text[prev:sp]
-                    while len(portion) > max_chars:
-                        chunks.append(portion[:max_chars])
-                        portion = portion[max_chars:]
-                    if portion:
-                        chunks.append(portion)
-                    prev = sp
-                elif sp - prev > 0:
-                    chunks.append(seg.text[prev:sp])
-                    prev = sp
-            # 残り
-            if prev < len(seg.text):
-                remaining = seg.text[prev:]
-                if chunks and len(chunks[-1]) + len(remaining) <= max_chars:
-                    chunks[-1] += remaining
-                else:
-                    chunks.append(remaining)
+            src_times.extend([None] * len(word))
+        src_chars.extend(word)
+    if not any(t is not None for t in src_times):
+        return None
+    known: List[Optional[Tuple[int, int]]] = [None] * len(text)
+    sm = difflib.SequenceMatcher(None, "".join(src_chars), text, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                known[j1 + k] = src_times[i1 + k]
+    if not any(t is not None for t in known):
+        return None
+    return _fill_times(known, seg_start, seg_end)
 
-            # チャンクを再結合（短すぎるチャンクを隣接と結合）
-            merged_chunks = [chunks[0]] if chunks else []
-            for c in chunks[1:]:
-                if len(merged_chunks[-1]) + len(c) <= max_chars:
-                    merged_chunks[-1] += c
-                else:
-                    merged_chunks.append(c)
-            chunks = merged_chunks
 
-        # 時間を文字数比率で配分
-        total_chars = sum(len(c) for c in chunks)
-        dur_ms = seg.end_ms - seg.start_ms
-        current_ms = seg.start_ms
-        for chunk in chunks:
-            chunk_dur = int(dur_ms * len(chunk) / total_chars) if total_chars > 0 else dur_ms // len(chunks)
-            result.append(Segment(
-                index=0,
-                start_ms=current_ms,
-                end_ms=current_ms + chunk_dur,
-                text=chunk,
-            ))
-            current_ms += chunk_dur
+def _map_times(src_text: str, src_times: List[Tuple[int, int]], dst_text: str,
+               seg_start: int, seg_end: int) -> List[Tuple[int, int]]:
+    """修正前の文字の時刻を、修正後のテキストに引き継ぐ。
+    同じ文字はそのまま、置き換えた部分は元の区間の時間を均等に分ける"""
+    known: List[Optional[Tuple[int, int]]] = [None] * len(dst_text)
+    sm = difflib.SequenceMatcher(None, src_text, dst_text, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for k in range(i2 - i1):
+                known[j1 + k] = src_times[i1 + k]
+        elif tag == "replace" and i2 > i1:
+            s, e = src_times[i1][0], src_times[i2 - 1][1]
+            for k, t in enumerate(_uniform_times(j2 - j1, s, e)):
+                known[j1 + k] = t
+    return _fill_times(known, seg_start, seg_end)
 
-    # インデックス振り直し
+
+def _split_text(text: str, max_chars: int = MAX_CHARS) -> List[str]:
+    """max_chars 以内になるよう文節の区切りで分ける。返す配列をつなげると元の text になる"""
+    if len(text) <= max_chars:
+        return [text] if text else []
+
+    split_points = _find_split_points(text, max_chars)
+    if not split_points:
+        # 分割候補がない場合は文字数で強制分割
+        return [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+
+    chunks: List[str] = []
+    prev = 0
+    for sp in split_points:
+        if sp - prev > max_chars and prev < sp:
+            # この区間が長すぎる場合は強制分割
+            portion = text[prev:sp]
+            while len(portion) > max_chars:
+                chunks.append(portion[:max_chars])
+                portion = portion[max_chars:]
+            if portion:
+                chunks.append(portion)
+            prev = sp
+        elif sp - prev > 0:
+            chunks.append(text[prev:sp])
+            prev = sp
+    if prev < len(text):
+        remaining = text[prev:]
+        if chunks and len(chunks[-1]) + len(remaining) <= max_chars:
+            chunks[-1] += remaining
+        else:
+            while len(remaining) > max_chars:
+                chunks.append(remaining[:max_chars])
+                remaining = remaining[max_chars:]
+            if remaining:
+                chunks.append(remaining)
+
+    # 短すぎるチャンクを隣と結合
+    merged = [chunks[0]] if chunks else []
+    for c in chunks[1:]:
+        if len(merged[-1]) + len(c) <= max_chars:
+            merged[-1] += c
+        else:
+            merged.append(c)
+    return merged
+
+
+def _segments_from_chunks(chunks: List[str], times: List[Tuple[int, int]],
+                          seg_start: int, seg_end: int) -> List[Segment]:
+    """チャンクごとの表示時刻を、文字の時刻から決める。
+    同じ発話の中では、次の字幕が出るまで前の字幕を表示し続ける (ちらつき防止)"""
+    starts: List[int] = []
+    pos = 0
+    for c in chunks:
+        starts.append(times[pos][0] if pos < len(times) else seg_end)
+        pos += len(c)
+    if starts:
+        starts[0] = min(seg_start, starts[0])
+
+    out: List[Segment] = []
+    for k, c in enumerate(chunks):
+        s = max(starts[k], out[-1].start_ms if out else seg_start)
+        e = starts[k + 1] if k + 1 < len(chunks) else max(seg_end, s)
+        if out and e <= s:
+            # 表示時間が取れない場合は前の字幕にまとめる
+            out[-1].text += c
+            continue
+        out.append(Segment(index=0, start_ms=s, end_ms=max(e, s), text=c))
+    if out:
+        out[-1].end_ms = max(out[-1].end_ms, seg_end)
+    return out
+
+
+def _seg_times(seg: Segment) -> Tuple[List[Tuple[int, int]], bool]:
+    """(1文字ごとの時刻, 推定かどうか) を返す"""
+    if seg.char_ms and len(seg.char_ms) == len(seg.text):
+        return list(seg.char_ms), False
+    return _uniform_times(len(seg.text), seg.start_ms, seg.end_ms), True
+
+
+def _local_split_segments(segments: List[Segment], max_chars: int = MAX_CHARS) -> List[Segment]:
+    """Gemini不要のローカル分割。文節の区切りで分け、表示時刻は文字の時刻から決める。
+    WhisperX の単語時刻がない時は、従来どおり文字数の比率で配分する"""
+    result: List[Segment] = []
+    for seg in segments:
+        times, _ = _seg_times(seg)
+        text, times = _clean_caption_text(seg.text, times)
+        if not text:
+            continue
+        result.extend(_segments_from_chunks(_split_text(text, max_chars), times, seg.start_ms, seg.end_ms))
     for i, seg in enumerate(result):
         seg.index = i + 1
     return result
@@ -612,14 +791,20 @@ def _transcribe_whisperx(wav_path: str) -> List[Segment]:
     except Exception as e:
         print(f"  ⚠️ WhisperX alignment 失敗（セグメントレベルで続行）: {e}")
 
-    # Segment[] に変換
+    # Segment[] に変換 (alignment できた文字の時刻を char_ms として保持する)
     segments = []
+    aligned = 0
     for i, seg in enumerate(result.get("segments", result if isinstance(result, list) else [])):
         start_ms = int(seg.get("start", 0) * 1000)
         end_ms = int(seg.get("end", 0) * 1000)
         text = seg.get("text", "").strip()
         if text:
-            segments.append(Segment(index=i + 1, start_ms=start_ms, end_ms=end_ms, text=text))
+            char_ms = _char_ms_from_words(text, seg.get("words") or [], start_ms, end_ms)
+            if char_ms:
+                aligned += 1
+            segments.append(Segment(index=i + 1, start_ms=start_ms, end_ms=end_ms,
+                                    text=text, char_ms=char_ms))
+    print(f"  🔊 WhisperX: 文字ごとの時刻あり {aligned}/{len(segments)} セグメント")
 
     # メモリ解放
     del model
@@ -1031,19 +1216,7 @@ def analyze_with_gemini(
 
 # ===== Step 3: SRT 生成 (captionモード統一: 元タイムスタンプ尊重) =====
 
-def build_srt(segments: List[Segment], audio_dur_ms: int, skip_refine: bool = False) -> str:
-    """captionモード SRT を生成する。元のタイムスタンプを尊重し、無音区間にはテロップを表示しない"""
-    if skip_refine:
-        # Gemini文字起こし済み → refine スキップ
-        print("  ℹ️ Gemini文字起こし済み → refine スキップ")
-        segments = _merge_short_segments(_local_split_segments(segments))
-    else:
-        # WhisperX / whisper-cli → Geminiテキスト修正（失敗時はローカル分割）
-        segments = _refine_segments(segments)
-
-    # タイムスタンプバリデーション（昇順保証・重複除去）
-    segments = _validate_srt_timestamps(segments, audio_dur_ms)
-
+def _segments_to_srt(segments: List[Segment]) -> str:
     lines = []
     for i, seg in enumerate(segments, 1):
         lines.append(str(i))
@@ -1051,6 +1224,112 @@ def build_srt(segments: List[Segment], audio_dur_ms: int, skip_refine: bool = Fa
         lines.append(seg.text)
         lines.append("")
     return "\n".join(lines)
+
+
+def build_srt(segments: List[Segment], audio_dur_ms: int, skip_refine: bool = False) -> str:
+    """captionモード SRT を生成する (後方互換用。新しい処理は build_captions)"""
+    return build_captions(segments, audio_dur_ms, skip_refine=skip_refine)["srt"]
+
+
+def build_captions(segments: List[Segment], audio_dur_ms: int,
+                   skip_refine: bool = False, fix_mode: str = "apply") -> Dict:
+    """字幕を作る。
+
+    fix_mode:
+      apply   … Gemini の修正を字幕に反映し、修正した箇所をすべて一覧に残す (既定)
+      propose … 字幕は音声認識のまま。Gemini の修正案を一覧にだけ出す
+      off     … Gemini を使わない (ローカル分割のみ)
+
+    戻り値: {"srt": 最終SRT, "asr_srt": 修正前SRT, "review": 確認リスト}
+    """
+    prepared = []  # (元のセグメント, 整形済みテキスト, 文字ごとの時刻, 時刻が推定か)
+    for seg in segments:
+        times, estimated = _seg_times(seg)
+        text, times = _clean_caption_text(seg.text, times)
+        if text:
+            prepared.append((seg, text, times, estimated))
+
+    # 修正前 (音声認識そのまま) の字幕
+    asr_segs: List[Segment] = []
+    asr_by_index: Dict[int, List[Segment]] = {}
+    for seg, text, times, _ in prepared:
+        parts = _segments_from_chunks(_split_text(text), times, seg.start_ms, seg.end_ms)
+        asr_by_index[seg.index] = parts
+        asr_segs.extend(parts)
+
+    review: Dict = {
+        "fix_mode": fix_mode,
+        "items": [],
+        "estimated_timing": sum(1 for p in prepared if p[3]),
+        "total_segments": len(prepared),
+        "failed_batches": 0,
+        "note": "",
+    }
+
+    corrections: Dict[int, Dict] = {}
+    if skip_refine:
+        review["note"] = "Gemini で文字起こし済みのため、字幕の修正処理は行っていません"
+    elif fix_mode == "off":
+        review["note"] = "--caption-fix off のため、字幕の修正処理は行っていません"
+    elif not os.environ.get("GEMINI_API_KEY"):
+        print("  ⚠️ GEMINI_API_KEY 未設定 → ローカル分割で処理")
+        review["note"] = "GEMINI_API_KEY 未設定のため、字幕の修正処理は行っていません"
+    else:
+        corrections, failed = _gemini_correct_captions([(p[0].index, p[1]) for p in prepared])
+        review["failed_batches"] = failed
+
+    final: List[Segment] = []
+    for seg, text, times, estimated in prepared:
+        corr = corrections.get(seg.index)
+        if corr is None:
+            final.extend(asr_by_index[seg.index])
+            continue
+
+        lines = [ln for ln in (_clean_caption_text(l)[0] for l in corr["lines"]) if ln]
+        corrected = "".join(lines)
+        resplit = any(len(l) > MAX_CHARS for l in lines)
+        if resplit:
+            lines = [c for l in lines for c in _split_text(l)]
+
+        changed = corrected != text
+        at_ms = asr_by_index[seg.index][0].start_ms
+        if changed:
+            review["items"].append({
+                "at_ms": at_ms,
+                "before": text,
+                "after": corrected,
+                "diff": _describe_diff(text, corrected),
+                "reasons": corr.get("reasons", []),
+                # 全文削除の提案は字幕に反映しない (発話が丸ごと消えるのを防ぐ)
+                "applied": fix_mode == "apply" and bool(lines),
+                "timing_estimated": estimated,
+            })
+
+        if fix_mode != "apply" or not lines:
+            # propose: 字幕は元のまま / 全文削除の提案も字幕からは消さない
+            final.extend(asr_by_index[seg.index])
+            continue
+
+        new_times = _map_times(text, times, corrected, seg.start_ms, seg.end_ms) if changed else times
+        final.extend(_segments_from_chunks(lines, new_times, seg.start_ms, seg.end_ms))
+
+    final = _validate_srt_timestamps(_merge_short_segments(final), audio_dur_ms)
+    asr_segs = _validate_srt_timestamps(_merge_short_segments(asr_segs), audio_dur_ms)
+    return {"srt": _segments_to_srt(final), "asr_srt": _segments_to_srt(asr_segs), "review": review}
+
+
+def _describe_diff(before: str, after: str) -> str:
+    """変更点を「A → B」の形で短く書く"""
+    parts = []
+    sm = difflib.SequenceMatcher(None, before, after, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "replace":
+            parts.append(f"「{before[i1:i2]}」→「{after[j1:j2]}」")
+        elif tag == "delete":
+            parts.append(f"「{before[i1:i2]}」を削除")
+        elif tag == "insert":
+            parts.append(f"「{after[j1:j2]}」を追加")
+    return "、".join(parts)
 
 
 def _validate_srt_timestamps(segments: List[Segment], audio_dur_ms: int) -> List[Segment]:
@@ -1077,76 +1356,138 @@ def _validate_srt_timestamps(segments: List[Segment], audio_dur_ms: int) -> List
     return result
 
 
-def _refine_segments(segments: List[Segment]) -> List[Segment]:
-    """Gemini Structured Outputs でテキストを修正・分割 → 失敗時はローカル分割フォールバック"""
+def _gemini_correct_captions(items: List[Tuple[int, str]]) -> Tuple[Dict[int, Dict], int]:
+    """Gemini に音声認識の誤りを直してもらい、字幕1枚ずつに分けた行と修正理由を受け取る。
+
+    時刻は Gemini に任せない (時刻は WhisperX の文字ごとの時刻から決める)。
+    戻り値: ({index: {"lines": [...], "reasons": [...]}}, 失敗したバッチ数)
+    """
     import time as _time
     from google import genai
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("  ⚠️ GEMINI_API_KEY 未設定 → ローカル分割で処理")
-        return _merge_short_segments(_local_split_segments(segments))
-
-    client = genai.Client(api_key=api_key, http_options={"timeout": 300000})
-    seg_list = [
-        {"index": s.index, "start_ms": s.start_ms, "end_ms": s.end_ms, "text": s.text}
-        for s in segments
-    ]
-    prompt = f"""以下はWhisperXが生成した音声認識結果（JSON）です。
-タイムスタンプはforced alignmentで単語レベルに正確です（±50ms程度）。
-以下のルールに従って修正し、JSON配列のみを返してください。
-
-ルール:
-1. start_ms/end_ms は**変更しない**（タイムスタンプの正確性を維持）
-2. 誤字脱字・不自然な表現を修正する
-3. 句読点「。」「、」は入れない。半角スペースも入れない
-4. 1セグメントが{MAX_CHARS}文字を超える場合、文字数比率で時間を比例配分して分割する
-5. 分割位置は**文節の区切り**を最優先する（「〜は」「〜が」「〜で」「〜を」などの助詞の直後）
-6. 助詞の途中や単語の途中で分割しない
-7. 「ん」の前で分割しない（例: 「なんぼ」→「な」+「んぼ」は不可）
-
-入力:
-{json.dumps(seg_list, ensure_ascii=False, indent=2)}
-"""
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"], http_options={"timeout": 300000})
     schema = {
         "type": "array",
         "items": {
             "type": "object",
             "properties": {
-                "text": {"type": "string"},
-                "start_ms": {"type": "integer"},
-                "end_ms": {"type": "integer"},
+                "index": {"type": "integer"},
+                "lines": {"type": "array", "items": {"type": "string"}},
+                "changes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "before": {"type": "string"},
+                            "after": {"type": "string"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["before", "after", "reason"],
+                    },
+                },
             },
-            "required": ["text", "start_ms", "end_ms"],
+            "required": ["index", "lines", "changes"],
         },
     }
 
-    # リトライ（指数バックオフ: 1s, 2s, 4s）
-    for attempt in range(3):
-        try:
-            print(f"  🤖 Gemini: テキスト修正中... (試行 {attempt + 1}/3)")
-            resp = client.models.generate_content(
-                model="gemini-3.6-flash",
-                contents=prompt,
-                config={"response_mime_type": "application/json", "response_schema": schema},
-            )
-            raw = json.loads(resp.text)
-            result = [
-                Segment(index=i + 1, start_ms=int(r["start_ms"]),
-                        end_ms=int(r["end_ms"]), text=r["text"])
-                for i, r in enumerate(raw)
-            ]
-            if result:
-                return _merge_short_segments(result)
-        except Exception as e:
-            wait = 2 ** attempt
-            print(f"  ⚠️ Gemini SRT refine 失敗 (試行 {attempt + 1}/3): {e}")
-            if attempt < 2:
-                print(f"     {wait}秒後にリトライ...")
-                _time.sleep(wait)
+    result: Dict[int, Dict] = {}
+    failed = 0
+    batches = [items[i:i + CAPTION_BATCH] for i in range(0, len(items), CAPTION_BATCH)]
+    for b, batch in enumerate(batches, 1):
+        valid = {idx for idx, _ in batch}
+        prompt = f"""以下は音声認識 (WhisperX) の結果です。字幕に使うため、各 index のテキストを整えて JSON 配列だけを返してください。
 
-    print("  ⚠️ Gemini 全試行失敗 → ローカル分割にフォールバック")
-    return _merge_short_segments(_local_split_segments(segments))
+ルール:
+1. 音声認識の誤り (同音異義語の取り違え・固有名詞の誤り・明らかな誤字脱字) だけを直す
+2. 話し言葉の言い回し・口調・方言・言いよどみは直さない。話した言葉をそのまま残す
+3. 自信がない箇所は直さず、元のまま残す
+4. 句読点「。」「、」と半角スペースは入れない
+5. lines は字幕1枚ずつの配列。1枚{MAX_CHARS}文字以内。lines をつなげると修正後の全文になるようにする
+6. 分ける位置は文節の区切り (「〜は」「〜が」「〜で」「〜を」など助詞の直後) を優先し、単語の途中や「ん」の前では分けない
+7. 直した箇所は changes に before / after / reason (短い日本語) で書く。直していなければ空配列
+8. 入力のすべての index を1回ずつ返す
+
+入力:
+{json.dumps([{"index": idx, "text": t} for idx, t in batch], ensure_ascii=False, indent=2)}
+"""
+        ok = False
+        for attempt in range(3):
+            try:
+                print(f"  🤖 Gemini: 字幕テキスト修正中... (バッチ {b}/{len(batches)}・試行 {attempt + 1}/3)")
+                resp = client.models.generate_content(
+                    model=CAPTION_MODEL,
+                    contents=prompt,
+                    config={"response_mime_type": "application/json", "response_schema": schema},
+                )
+                for r in json.loads(resp.text):
+                    idx = int(r.get("index", -1))
+                    if idx in valid and idx not in result:
+                        result[idx] = {
+                            "lines": [str(x) for x in r.get("lines", [])],
+                            "reasons": [
+                                f"「{c.get('before', '')}」→「{c.get('after', '')}」: {c.get('reason', '')}"
+                                for c in r.get("changes", [])
+                            ],
+                        }
+                ok = True
+                break
+            except Exception as e:
+                wait = 2 ** attempt
+                print(f"  ⚠️ 字幕修正 失敗 (試行 {attempt + 1}/3): {e}")
+                if attempt < 2:
+                    _time.sleep(wait)
+        if not ok:
+            failed += 1
+            print(f"  ⚠️ バッチ {b} は修正なし (音声認識のまま) で続行")
+    return result, failed
+
+
+def write_caption_review(out_dir: Path, review: Dict) -> Tuple[Path, Path]:
+    """字幕の確認リスト (Markdown) と、place_markers.jsx 用のマーカー JSON を書き出す"""
+    items = sorted(review["items"], key=lambda x: x["at_ms"])
+    applied = review["fix_mode"] == "apply"
+
+    md = ["# 字幕の確認リスト", ""]
+    if review.get("note"):
+        md += [f"- {review['note']}"]
+    md += [
+        f"- 字幕の修正: {'反映済み (captions.srt)。修正前は captions_asr.srt' if applied else '未反映。下の修正案を見て手で直してください'}",
+        f"- 修正{'した' if applied else '案のある'}箇所: {len(items)}件",
+    ]
+    if review["failed_batches"]:
+        md.append(f"- ⚠️ Gemini の修正に失敗したバッチ: {review['failed_batches']}件 (その部分は音声認識のまま)")
+    if review["total_segments"] and review["estimated_timing"]:
+        if review["estimated_timing"] == review["total_segments"]:
+            md.append("- ⚠️ 単語ごとの時刻がないため、表示タイミングは文字数から推定しています (whisper-cli / Gemini 文字起こし)")
+        else:
+            md.append(f"- 表示タイミングを文字数から推定した発話: {review['estimated_timing']}/{review['total_segments']}件")
+    for line in review.get("clip_timing", []):
+        md.append(f"- {line}")
+    md.append("")
+
+    if items:
+        md += ["| 位置 | 現状 (音声認識) | 修正" + ("後" if applied else "案") + " | 変更点 | 理由 |",
+               "|---|---|---|---|---|"]
+        for it in items:
+            reason = " / ".join(it["reasons"]) if it["reasons"] else "(理由の記載なし)"
+            cells = [_format_ts(it["at_ms"])[:8], it["before"], it["after"], it["diff"], reason]
+            md.append("| " + " | ".join(c.replace("|", "｜") for c in cells) + " |")
+    else:
+        md.append("修正箇所はありません。")
+    md += ["", "固有名詞・専門用語・聞き取りにくい箇所は、修正の有無にかかわらず通しで確認してください。", ""]
+
+    md_path = out_dir / "caption_review.md"
+    md_path.write_text("\n".join(md), encoding="utf-8")
+
+    markers = [{
+        "at_ms": it["at_ms"],
+        "name": "字幕:修正済み" if it["applied"] else "字幕:修正案",
+        "comment": f"{it['before']} → {it['after']}"
+                   + (f"（{' / '.join(it['reasons'])}）" if it["reasons"] else ""),
+    } for it in items]
+    json_path = out_dir / "caption_review.json"
+    json_path.write_text(json.dumps({"caption_review": markers}, ensure_ascii=False, indent=2), encoding="utf-8")
+    return md_path, json_path
 
 
 # ===== Step 4: インサート画像生成 =====
@@ -1443,8 +1784,11 @@ def build_fcp7_xml(
         return ci
 
     # ---- V1 / A1: カット済みクリップを配置（分割なし）----
+    # 開始位置は get_clip_durations が映像のフレーム数から計算した start_ms を使う
+    # (ms の端数を足し続けると、クリップ数が多い時に1フレームの隙間・重なりが出るため)
     tl_cursor = 0
     for i, clip in enumerate(clips_info):
+        tl_cursor = clip.start_ms
         fid = f"file-{i + 1}"
         v_id = _next_id("v")
         a_id = _next_id("a")
@@ -1479,6 +1823,7 @@ def build_fcp7_xml(
 
     tl_cursor_v2 = 0
     for i, clip in enumerate(clips_info):
+        tl_cursor_v2 = clip.start_ms
         for zoom_start_ms, zoom_end_ms in _get_zoom_intervals(i, clip):
             zoom_tl_start = tl_cursor_v2 + zoom_start_ms
             zoom_tl_end   = tl_cursor_v2 + zoom_end_ms
@@ -1672,6 +2017,8 @@ def main():
                         help="[非推奨] デフォルトがWhisperXになったため不要。無視されます")
     parser.add_argument("--use-gemini-transcribe", action="store_true",
                         help="[非推奨] --experimental-gemini を使用してください")
+    parser.add_argument("--caption-fix", choices=["apply", "propose", "off"], default="apply",
+                        help="字幕の修正: apply=反映して一覧に残す(既定) / propose=字幕は元のまま修正案だけ一覧に出す / off=修正しない")
     parser.add_argument("--only", default=None,
                         help="指定ステップのみ実行（カンマ区切り: sfx,zoom,insert,srt）")
     parser.add_argument("--skip", default=None,
@@ -1717,8 +2064,15 @@ def main():
     # ---- Step 1 ----
     print("\n[Step 1] クリップ情報取得・文字起こし中...")
     clips_info = get_clip_durations(mp4_files)
-    total_dur_ms = sum(c.duration_ms for c in clips_info)
+    total_dur_ms = clips_info[-1].start_ms + clips_info[-1].duration_ms
     print(f"  合計尺: {total_dur_ms / 1000:.1f} 秒")
+    clip_timing_lines = report_clip_timing(clips_info)
+    for line in clip_timing_lines:
+        print(f"  ⏱ {line}")
+
+    # 後方互換: --use-gemini-transcribe → --experimental-gemini
+    use_gemini = args.experimental_gemini or args.use_gemini_transcribe
+    srt_path = out_dir / "captions.srt"
 
     if args.reuse_analysis:
         print("  --reuse-analysis: Whisper スキップ")
@@ -1729,16 +2083,18 @@ def main():
             print(f"エラー: --skip-whisper が指定されましたが {seg_json} が見つかりません（先に通常実行してください）")
             sys.exit(1)
         raw = json.loads(seg_json.read_text(encoding="utf-8"))
-        segments = [Segment(index=s["index"], start_ms=s["start_ms"], end_ms=s["end_ms"], text=s["text"]) for s in raw]
+        segments = [Segment(index=s["index"], start_ms=s["start_ms"], end_ms=s["end_ms"], text=s["text"],
+                            char_ms=[tuple(t) for t in s["char_ms"]] if s.get("char_ms") else None)
+                    for s in raw]
         print(f"  --skip-whisper: segments.json を再利用 ({len(segments)} セグメント)")
+        if segments and not any(s.char_ms for s in segments):
+            print("  ℹ️ segments.json に文字ごとの時刻がありません（旧形式）。表示タイミングは文字数から推定します")
     else:
         model_path = args.model
         if not Path(model_path).exists():
             print(f"エラー: whisper モデルが見つからない: {model_path}")
             print(f"  ダウンロード: curl -L https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin -o {model_path}")
             sys.exit(1)
-        # 後方互換: --use-gemini-transcribe → --experimental-gemini
-        use_gemini = args.experimental_gemini or args.use_gemini_transcribe
         if args.use_whisperx:
             print("  ℹ️ --use-whisperx は非推奨（デフォルトがWhisperXになりました）")
         if args.use_gemini_transcribe:
@@ -1749,7 +2105,9 @@ def main():
         print(f"  whisper セグメント数: {len(segments)}")
         seg_json = out_dir / "segments.json"
         seg_json.write_text(
-            json.dumps([{"index": s.index, "start_ms": s.start_ms, "end_ms": s.end_ms, "text": s.text} for s in segments],
+            json.dumps([{"index": s.index, "start_ms": s.start_ms, "end_ms": s.end_ms, "text": s.text,
+                         **({"char_ms": [list(t) for t in s.char_ms]} if s.char_ms else {})}
+                        for s in segments],
                        ensure_ascii=False, indent=2), encoding="utf-8"
         )
         print(f"  segments.json 保存: {seg_json}")
@@ -1806,10 +2164,17 @@ def main():
         print("\n[Step 3] --reuse-analysis: SRT 生成スキップ")
     else:
         print("\n[Step 3] SRT 生成中...")
-        srt_content = build_srt(segments, total_dur_ms, skip_refine=use_gemini)
-        srt_path = out_dir / "captions.srt"
-        srt_path.write_text(srt_content, encoding="utf-8")
+        captions = build_captions(segments, total_dur_ms, skip_refine=use_gemini, fix_mode=args.caption_fix)
+        srt_path.write_text(captions["srt"], encoding="utf-8")
         print(f"  ✅ captions.srt 保存: {srt_path}")
+        asr_path = out_dir / "captions_asr.srt"
+        asr_path.write_text(captions["asr_srt"], encoding="utf-8")
+        print(f"  ✅ captions_asr.srt 保存（修正前の字幕）: {asr_path}")
+        captions["review"]["clip_timing"] = clip_timing_lines
+        md_path, marker_path = write_caption_review(out_dir, captions["review"])
+        n_fix = len(captions["review"]["items"])
+        print(f"  ✅ caption_review.md 保存（修正{'した' if args.caption_fix == 'apply' else '案のある'}箇所 {n_fix}件）: {md_path}")
+        print(f"  ✅ caption_review.json 保存（place_markers.jsx 用）: {marker_path}")
 
     # ---- インサート画像バリデーション ----
     if insert_events:
@@ -1917,6 +2282,8 @@ def main():
     print(f"  出力先             : {out_dir}")
     print(f"{'='*50}")
     print("  - captions.srt  : Premiere Pro で Import → caption track 化（captionモード）")
+    print("  - caption_review.md   : 字幕の修正箇所と理由（現状 → 修正 → 理由）")
+    print("  - caption_review.json : place_markers.jsx で読み込むと、修正箇所にマーカーが付く")
     print("  - sequence.xml  : Premiere Pro で Import")
     print("  - sfx_manifest.json")
     if any(p is not None for p in insert_imgs):

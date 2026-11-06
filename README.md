@@ -7,6 +7,9 @@
 ```
 output/
 ├── captions.srt          # テロップ用字幕（Premiere ProにImport）
+├── captions_asr.srt      # 修正前の字幕（音声認識そのまま。比較・差し戻し用）
+├── caption_review.md     # 字幕の確認リスト（現状 → 修正 → 理由）
+├── caption_review.json   # 修正箇所のマーカー（place_markers.jsx で読み込む）
 ├── sequence.xml          # FCP7 XML（Premiere ProにImport）
 ├── sfx_manifest.json     # 効果音タイミング（参照用）
 ├── report.txt            # ハイライト区間・サムネイル案
@@ -96,6 +99,7 @@ GEMINI_MAX_IMAGE_COST_USD=2.0 python3 scripts/create_youtube_sequence.py \
 | `--output` | 出力先フォルダ（デフォルト: `--clips/output/`） |
 | `--insert-target` | インサート画像の生成指示（Gemini向けプロンプト） |
 | `--skip-whisper` | 既存の `segments.json` を再利用してWhisperをスキップ |
+| `--caption-fix` | 字幕の修正方法。`apply`=Geminiの修正を反映して一覧に残す（デフォルト） / `propose`=字幕は音声認識のまま、修正案だけ一覧に出す / `off`=修正しない |
 | `--reuse-analysis` | 既存の `analysis_debug.json` を再利用して画像・XMLのみ再生成 |
 | `--no-insert` | インサート画像の生成をスキップ |
 | `--only sfx,srt,...` | 指定ステップのみ実行（sfx/zoom/insert/srt） |
@@ -108,6 +112,29 @@ GEMINI_MAX_IMAGE_COST_USD=2.0 python3 scripts/create_youtube_sequence.py \
 | 初回・新しい動画 | なし |
 | 効果音ルールや分析プロンプトを変えて再テスト | `--skip-whisper` |
 | 画像プロンプトは変えずに画像だけ再生成 | `--reuse-analysis` |
+
+### 字幕の修正と確認リスト
+
+Geminiが直すのは、音声認識の誤り（同音異義語の取り違え・固有名詞・明らかな誤字脱字）だけです。話し言葉の言い回しや方言は直しません。
+
+直した箇所はすべて `caption_review.md` に「現状 → 修正 → 理由」の形で残ります。修正前の字幕は `captions_asr.srt` に残るので、戻したい箇所はそこから差し戻せます。
+
+- 修正を字幕に入れず、案だけ見て自分で直したい場合は `--caption-fix propose`
+- `caption_review.json` を `place_markers.jsx` で読み込むと、修正箇所にシーケンスマーカー（白）が付きます
+
+### 字幕の表示タイミング
+
+WhisperXで文字起こしした場合、1文字ごとの時刻（forced alignment）を使って字幕の分割位置の時刻を決めます。早口や間がある発話でも、字幕が話し始めに合わせて出ます。
+
+whisper-cli（`--fast`）やGemini文字起こしでは文字ごとの時刻がないため、従来どおり文字数の比率で推定します（`caption_review.md` に表示されます）。
+
+> 以前の `segments.json`（文字ごとの時刻なし）を `--skip-whisper` で再利用した場合も、文字数からの推定になります。精度を上げたい場合は一度通常実行してください。
+
+### クリップの長さと時刻のずれ
+
+クリップの長さは映像のフレーム数で計算し、文字起こし用の音声も各クリップを映像の長さに揃えてから連結します。
+
+以前はクリップの音声をそのまま連結していたため、AAC音声のクリップでは1本あたり約10msずつ音声が長くなり、クリップ数が多いほど後半の字幕・効果音・インサートが映像より遅れていました（テスト用の99クリップ・約4分20秒で約1.1秒）。音声のないクリップが混ざっていても無音として扱います。
 
 ### コスト管理
 
@@ -124,6 +151,7 @@ GEMINI_MAX_IMAGE_COST_USD=2.0 python3 scripts/create_youtube_sequence.py ...
 
 1. `File > Import` で `sequence.xml` を読み込む
 2. `captions.srt` を Import してキャプショントラックに変換
+3. `caption_review.md` を見ながら字幕を確認する（`place_markers.jsx` で `caption_review.json` を読み込むと、修正箇所にマーカーが付きます）
 
 ### ズームエフェクトの適用（ワンクリック）
 
