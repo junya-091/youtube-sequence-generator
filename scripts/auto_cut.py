@@ -211,12 +211,20 @@ start_ms/end_msはミリ秒単位。
             }
 
             try:
-                print(f"  🤖 Gemini: フィラー検出中 ({chunk_start:.0f}s-{chunk_end:.0f}s)...")
-                resp = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=prompt,
-                    config={"response_mime_type": "application/json", "response_schema": schema},
-                )
+                models = ["gemini-3.6-flash", "gemini-2.5-flash"]
+                for model in models:
+                    try:
+                        print(f"  🤖 Gemini: フィラー検出中 ({chunk_start:.0f}s-{chunk_end:.0f}s・{model})...")
+                        resp = client.models.generate_content(
+                            model=model,
+                            contents=prompt,
+                            config={"response_mime_type": "application/json", "response_schema": schema},
+                        )
+                        break
+                    except Exception as e:
+                        if "503" not in str(e) or model == models[-1]:
+                            raise  # 503以外のエラーはフォールバックしない
+                        print(f"  ⚠️ Gemini フィラー検出失敗 ({model}): {e} → {models[-1]} で再試行")
                 data = json.loads(resp.text)
                 for r in data.get("filler_regions", []):
                     all_filler.append(Region(start=r["start_ms"]/1000, end=r["end_ms"]/1000, kind="filler", text=r.get("text", "")))

@@ -475,13 +475,21 @@ def _transcribe_gemini_single(client, types, wav_path: str, offset_ms: int,
     for attempt in range(max_retries):
         try:
             print(f"     文字起こし中... (試行 {attempt + 1}/{max_retries})")
-            resp = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
-                    types.Part.from_uri(file_uri=uploaded.uri, mime_type=uploaded.mime_type),
-                    prompt,
-                ],
-            )
+            models = ["gemini-3.6-flash", "gemini-2.5-flash"]
+            for model in models:
+                try:
+                    resp = client.models.generate_content(
+                        model=model,
+                        contents=[
+                            types.Part.from_uri(file_uri=uploaded.uri, mime_type=uploaded.mime_type),
+                            prompt,
+                        ],
+                    )
+                    break
+                except Exception as e:
+                    if "503" not in str(e) or model == models[-1]:
+                        raise  # 503以外のエラーはフォールバックしない (外側のリトライへ)
+                    print(f"     ⚠️ 失敗 ({model}): {e} → {models[-1]} で再試行")
             srt_text = resp.text.strip()
             segments = _parse_srt_text(srt_text)
             if not segments:
