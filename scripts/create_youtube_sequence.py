@@ -52,6 +52,9 @@ VERTICAL_MAX_CHARS = 14  # 縦・正方形のときの字幕1枚あたりの最�
 CAPTION_MODEL = "gemini-3.6-flash"  # 字幕テキスト修正に使うモデル
 CAPTION_BATCH = 120                 # 字幕修正を Gemini に送る1回あたりのセグメント数
 
+TERMS_FILENAME = "terms.txt"   # --clips フォルダにあれば自動で読み込む用語リスト
+WHISPER_PROMPT_MAX_CHARS = 100  # Whisper に渡す用語の合計文字数の上限 (プロンプトは約224トークンまで)
+
 # ===== データクラス =====
 
 @dataclass
@@ -841,8 +844,41 @@ def _merge_short_segments(segments: List[Segment]) -> List[Segment]:
     return merged
 
 
-def _transcribe_whisperx(wav_path: str) -> List[Segment]:
-    """WhisperX で文字起こし + forced alignment → Segment[]"""
+def load_terms(path: Path) -> List[str]:
+    """用語リストを読む。1行1語 (正しい表記)。空行と # で始まる行は無視し、重複は1つにまとめる"""
+    terms: List[str] = []
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        term = line.strip()
+        if term and not term.startswith("#") and term not in terms:
+            terms.append(term)
+    return terms
+
+
+def find_terms_file(terms_arg: Optional[str], clips_dir: Path) -> Tuple[Optional[Path], bool]:
+    """使う用語リストのパスを決める。戻り値: (パス or None, 自動で見つけたか)
+    --terms の指定がなければ、--clips フォルダの terms.txt を使う"""
+    if terms_arg:
+        return Path(terms_arg).expanduser(), False
+    auto = clips_dir / TERMS_FILENAME
+    if auto.is_file():
+        return auto, True
+    return None, False
+
+
+def whisper_prompt_from_terms(terms: List[str]) -> Tuple[str, int]:
+    """Whisper に渡すプロンプトを作る。長すぎると先頭が切り捨てられるため、
+    合計 WHISPER_PROMPT_MAX_CHARS 文字までの語だけを使う。戻り値: (プロンプト, 使った語数)"""
+    picked: List[str] = []
+    for term in terms:
+        if len("、".join(picked + [term])) > WHISPER_PROMPT_MAX_CHARS:
+            break
+        picked.append(term)
+    return "、".join(picked), len(picked)
+
+
+def _transcribe_whisperx(wav_path: str, prompt: Optional[str] = None) -> List[Segment]:
+    """WhisperX で文字起こし + forced alignment → Segment[]
+    prompt: 用語リストから作ったプロンプト (initial_prompt として渡す)"""
     import whisperx
     import torch
 
@@ -850,7 +886,17 @@ def _transcribe_whisperx(wav_path: str) -> List[Segment]:
     compute_type = "int8"  # M2 Air のメモリ節約
 
     print("  🔊 WhisperX: モデルロード中...")
-    model = whisperx.load_model("large-v3", device, compute_type=compute_type, language="ja")
+    model = None
+    if prompt:
+        try:
+            model = whisperx.load_model("large-v3", device, compute_type=compute_type, language="ja",
+                                        asr_options={"initial_prompt": prompt})
+            print("  🔊 WhisperX: 用語リストをプロンプトとして指定")
+        except TypeError as e:
+            # 古い whisperx は asr_options / initial_prompt に対応していないことがある
+            print(f"  ⚠️ この whisperx は用語リストの指定に対応していません ({e}) → 指定なしで続行")
+    if model is None:
+        model = whisperx.load_model("large-v3", device, compute_type=compute_type, language="ja")
 
     print("  🔊 WhisperX: 文字起こし中...")
     audio = whisperx.load_audio(wav_path)
@@ -887,15 +933,15 @@ def _transcribe_whisperx(wav_path: str) -> List[Segment]:
     return segments
 
 
-def _transcribe_whisper_cli(wav_path: str, model_path: str) -> List[Segment]:
-    """whisper-cli フォールバック"""
+def _transcribe_whisper_cli(wav_path: str, model_path: str, prompt: Optional[str] = None) -> List[Segment]:
+    """whisper-cli フォールバック (prompt: 用語リストから作ったプロンプト)"""
     with tempfile.TemporaryDirectory() as tmpdir:
         srt_prefix = str(Path(tmpdir) / "output")
-        subprocess.run(
-            ["whisper-cli", "-m", model_path, "-f", wav_path,
-             "-l", "ja", "--output-srt", "-of", srt_prefix, "--max-len", "40"],
-            check=True,
-        )
+        cmd = ["whisper-cli", "-m", model_path, "-f", wav_path,
+               "-l", "ja", "--output-srt", "-of", srt_prefix, "--max-len", "40"]
+        if prompt:
+            cmd += ["--prompt", prompt]
+        subprocess.run(cmd, check=True)
         srt_path = Path(tmpdir) / "output.srt"
         if not srt_path.exists():
             raise RuntimeError("whisper-cli が SRT を生成しなかった")
@@ -903,8 +949,10 @@ def _transcribe_whisper_cli(wav_path: str, model_path: str) -> List[Segment]:
 
 
 def concat_and_transcribe(clips_info: List[ClipInfo], model_path: str,
-                          fast: bool = False, experimental_gemini: bool = False) -> List[Segment]:
-    """ffmpeg で音声連結 → WhisperX(デフォルト) / whisper-cli(--fast) / Gemini(実験的) → Segment[]"""
+                          fast: bool = False, experimental_gemini: bool = False,
+                          prompt: Optional[str] = None) -> List[Segment]:
+    """ffmpeg で音声連結 → WhisperX(デフォルト) / whisper-cli(--fast) / Gemini(実験的) → Segment[]
+    prompt: 用語リストから作ったプロンプト (WhisperX / whisper-cli に渡す)"""
     with tempfile.TemporaryDirectory() as tmpdir:
         wav_path = str(Path(tmpdir) / "concat.wav")
         _concat_audio(clips_info, wav_path)
@@ -918,25 +966,25 @@ def concat_and_transcribe(clips_info: List[ClipInfo], model_path: str,
                 print(f"\n  ❌ Gemini 文字起こし失敗: {e}")
                 print("  → WhisperX に自動フォールバック")
                 try:
-                    segments = _transcribe_whisperx(wav_path)
+                    segments = _transcribe_whisperx(wav_path, prompt)
                     if segments:
                         segments = _local_split_segments(segments, MAX_CHARS)
                         print(f"  ✅ WhisperX + ローカル分割完了: {len(segments)} セグメント")
                         return segments
                 except Exception as e2:
                     print(f"  ⚠️ WhisperX も失敗: {e2} → whisper-cli へ")
-                segments = _transcribe_whisper_cli(wav_path, model_path)
+                segments = _transcribe_whisper_cli(wav_path, model_path, prompt)
                 segments = _local_split_segments(segments, MAX_CHARS)
                 print(f"  ✅ whisper-cli + ローカル分割完了: {len(segments)} セグメント")
                 return segments
 
         if fast:
             # --fast: whisper-cli で高速処理
-            return _transcribe_whisper_cli(wav_path, model_path)
+            return _transcribe_whisper_cli(wav_path, model_path, prompt)
 
         # デフォルト: WhisperX（精度優先）→ 失敗時 whisper-cli フォールバック
         try:
-            segments = _transcribe_whisperx(wav_path)
+            segments = _transcribe_whisperx(wav_path, prompt)
             if segments:
                 print(f"  ✅ WhisperX 完了: {len(segments)} セグメント")
                 return segments
@@ -944,7 +992,7 @@ def concat_and_transcribe(clips_info: List[ClipInfo], model_path: str,
         except Exception as e:
             print(f"  ⚠️ WhisperX 失敗: {e} → whisper-cli にフォールバック")
 
-        return _transcribe_whisper_cli(wav_path, model_path)
+        return _transcribe_whisper_cli(wav_path, model_path, prompt)
 
 
 def _parse_srt(srt_path: Path) -> List[Segment]:
@@ -1305,13 +1353,16 @@ def build_srt(segments: List[Segment], audio_dur_ms: int, skip_refine: bool = Fa
 
 
 def build_captions(segments: List[Segment], audio_dur_ms: int,
-                   skip_refine: bool = False, fix_mode: str = "apply") -> Dict:
+                   skip_refine: bool = False, fix_mode: str = "apply",
+                   terms: Optional[List[str]] = None) -> Dict:
     """字幕を作る。
 
     fix_mode:
       apply   … Gemini の修正を字幕に反映し、修正した箇所をすべて一覧に残す (既定)
       propose … 字幕は音声認識のまま。Gemini の修正案を一覧にだけ出す
       off     … Gemini を使わない (ローカル分割のみ)
+
+    terms: 用語リスト (正しい表記)。Gemini の修正で、明らかな聞き間違いをこの表記に直す
 
     戻り値: {"srt": 最終SRT, "asr_srt": 修正前SRT, "review": 確認リスト}
     """
@@ -1338,6 +1389,9 @@ def build_captions(segments: List[Segment], audio_dur_ms: int,
         "failed_batches": 0,
         "note": "",
     }
+    if terms:
+        review["terms_count"] = len(terms)
+        review["terms_in_fix"] = False
 
     corrections: Dict[int, Dict] = {}
     if skip_refine:
@@ -1348,8 +1402,10 @@ def build_captions(segments: List[Segment], audio_dur_ms: int,
         print("  ⚠️ GEMINI_API_KEY 未設定 → ローカル分割で処理")
         review["note"] = "GEMINI_API_KEY 未設定のため、字幕の修正処理は行っていません"
     else:
-        corrections, failed = _gemini_correct_captions([(p[0].index, p[1]) for p in prepared])
+        corrections, failed = _gemini_correct_captions([(p[0].index, p[1]) for p in prepared], terms)
         review["failed_batches"] = failed
+        if terms:
+            review["terms_in_fix"] = True
 
     final: List[Segment] = []
     for seg, text, times, estimated in prepared:
@@ -1429,8 +1485,10 @@ def _validate_srt_timestamps(segments: List[Segment], audio_dur_ms: int) -> List
     return result
 
 
-def _gemini_correct_captions(items: List[Tuple[int, str]]) -> Tuple[Dict[int, Dict], int]:
+def _gemini_correct_captions(items: List[Tuple[int, str]],
+                             terms: Optional[List[str]] = None) -> Tuple[Dict[int, Dict], int]:
     """Gemini に音声認識の誤りを直してもらい、字幕1枚ずつに分けた行と修正理由を受け取る。
+    terms (用語リスト) があれば、その表記をこの案件の正しい表記として渡す。
 
     時刻は Gemini に任せない (時刻は WhisperX の文字ごとの時刻から決める)。
     戻り値: ({index: {"lines": [...], "reasons": [...]}}, 失敗したバッチ数)
@@ -1463,6 +1521,16 @@ def _gemini_correct_captions(items: List[Tuple[int, str]]) -> Tuple[Dict[int, Di
         },
     }
 
+    terms_block = ""
+    if terms:
+        terms_block = (
+            "\nこの案件の用語の正しい表記 (固有名詞・専門用語):\n"
+            + "\n".join(f"- {t}" for t in terms)
+            + "\n音声認識のテキストが、明らかにこれらの用語の聞き間違いである場合は、この表記に直す。"
+            "聞き間違いかどうか自信がない場合は直さない。言い回し・口調・方言を直さないルール (2) はそのまま守り、"
+            "直した箇所は必ず changes に書く\n"
+        )
+
     result: Dict[int, Dict] = {}
     failed = 0
     batches = [items[i:i + CAPTION_BATCH] for i in range(0, len(items), CAPTION_BATCH)]
@@ -1479,7 +1547,7 @@ def _gemini_correct_captions(items: List[Tuple[int, str]]) -> Tuple[Dict[int, Di
 6. 分ける位置は文節の区切り (「〜は」「〜が」「〜で」「〜を」など助詞の直後) を優先し、単語の途中や「ん」の前では分けない
 7. 直した箇所は changes に before / after / reason (短い日本語) で書く。直していなければ空配列
 8. 入力のすべての index を1回ずつ返す
-
+{terms_block}
 入力:
 {json.dumps([{"index": idx, "text": t} for idx, t in batch], ensure_ascii=False, indent=2)}
 """
@@ -1534,6 +1602,11 @@ def write_caption_review(out_dir: Path, review: Dict) -> Tuple[Path, Path]:
             md.append("- ⚠️ 単語ごとの時刻がないため、表示タイミングは文字数から推定しています (whisper-cli / Gemini 文字起こし)")
         else:
             md.append(f"- 表示タイミングを文字数から推定した発話: {review['estimated_timing']}/{review['total_segments']}件")
+    if review.get("terms_count"):
+        src = f"（{review['terms_source']}）" if review.get("terms_source") else ""
+        md.append(f"- 用語リスト{src}: {review['terms_count']}語"
+                  + (" を字幕の修正に使用" if review.get("terms_in_fix")
+                     else "（字幕の修正は行っていないため、Gemini には渡していません）"))
     for line in review.get("clip_timing", []):
         md.append(f"- {line}")
     md.append("")
@@ -2401,6 +2474,8 @@ def main():
                         help="[非推奨] デフォルトがWhisperXになったため不要。無視されます")
     parser.add_argument("--use-gemini-transcribe", action="store_true",
                         help="[非推奨] --experimental-gemini を使用してください")
+    parser.add_argument("--terms", default=None,
+                        help=f"用語リスト（1行1語・UTF-8）。音声認識と字幕の修正に使う。省略時は --clips フォルダの {TERMS_FILENAME} があれば使う")
     parser.add_argument("--caption-fix", choices=["apply", "propose", "off"], default="apply",
                         help="字幕の修正: apply=反映して一覧に残す(既定) / propose=字幕は元のまま修正案だけ一覧に出す / off=修正しない")
     parser.add_argument("--size", default="fhd",
@@ -2467,6 +2542,25 @@ def main():
     for f in mp4_files:
         print(f"   - {f.name}")
 
+    # 用語リスト (--terms / --clips フォルダの terms.txt)
+    terms: List[str] = []
+    terms_path, terms_auto = find_terms_file(args.terms, clips_dir)
+    if terms_path is not None:
+        if not terms_path.is_file():
+            print(f"エラー: --terms が見つからない: {terms_path}")
+            sys.exit(1)
+        terms = load_terms(terms_path)
+        how = "を自動で読み込みました" if terms_auto else ""
+        print(f"📖 用語リスト: {terms_path.name}{how}（{len(terms)}語）")
+        if not terms:
+            print("  ⚠️ 用語リストに有効な行がありません（空行と # の行は無視されます）")
+    whisper_prompt = None
+    if terms:
+        whisper_prompt, n_prompt = whisper_prompt_from_terms(terms)
+        if n_prompt < len(terms):
+            print(f"  ⚠️ 音声認識に渡せるのは先頭 {n_prompt}語まで（合計{WHISPER_PROMPT_MAX_CHARS}文字まで）。"
+                  f"残り {len(terms) - n_prompt}語は字幕の修正 (Gemini) だけで使います")
+
     out_dir = Path(args.output) if args.output else clips_dir / "output"
     out_dir.mkdir(parents=True, exist_ok=True)
     inserts_dir = out_dir / "inserts"
@@ -2521,7 +2615,8 @@ def main():
             print("  ℹ️ --use-gemini-transcribe は非推奨。--experimental-gemini を使用してください")
         segments = concat_and_transcribe(clips_info, model_path,
                                          fast=args.fast,
-                                         experimental_gemini=use_gemini)
+                                         experimental_gemini=use_gemini,
+                                         prompt=whisper_prompt or None)
         print(f"  whisper セグメント数: {len(segments)}")
         seg_json = out_dir / "segments.json"
         seg_json.write_text(
@@ -2584,13 +2679,16 @@ def main():
         print("\n[Step 3] --reuse-analysis: SRT 生成スキップ")
     else:
         print("\n[Step 3] SRT 生成中...")
-        captions = build_captions(segments, total_dur_ms, skip_refine=use_gemini, fix_mode=args.caption_fix)
+        captions = build_captions(segments, total_dur_ms, skip_refine=use_gemini, fix_mode=args.caption_fix,
+                                  terms=terms or None)
         srt_path.write_text(captions["srt"], encoding="utf-8")
         print(f"  ✅ captions.srt 保存: {srt_path}")
         asr_path = out_dir / "captions_asr.srt"
         asr_path.write_text(captions["asr_srt"], encoding="utf-8")
         print(f"  ✅ captions_asr.srt 保存（修正前の字幕）: {asr_path}")
         captions["review"]["clip_timing"] = clip_timing_lines
+        if terms:
+            captions["review"]["terms_source"] = terms_path.name
         md_path, marker_path = write_caption_review(out_dir, captions["review"])
         n_fix = len(captions["review"]["items"])
         print(f"  ✅ caption_review.md 保存（修正{'した' if args.caption_fix == 'apply' else '案のある'}箇所 {n_fix}件）: {md_path}")
